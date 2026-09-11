@@ -1,0 +1,78 @@
+# Repsetarr configuration.
+#
+# Everything below is optional except `sources` and `lists`. Values may contain
+# ${ENV_VAR} or ${ENV_VAR:-fallback}, so secrets can stay in the environment.
+#
+# Operators:   |  +  union        -  difference
+#              &  intersection    ^  in exactly one side
+# Precedence follows Python's set operators - `-` and `+` bind tightest, then
+# `&`, then `^`, then `|`. Bracket anything non-obvious.
+# A name containing `-` must be quoted, because `-` is an operator: "top-250".
+
+server:
+  host: 0.0.0.0
+  port: 9797
+
+cache:
+  dir: /config/cache
+  # Refresh interval for sources that do not set their own `ttl`.
+  default_ttl: 6h
+  # How often Repsetarr looks for sources that have aged out.
+  check_interval: 1m
+  persist: true
+
+providers:
+  mdblist:
+    apikey: ${MDBLIST_API_KEY:-}
+
+sources:
+  # An MDBList list, addressed by `username/listname`, by `list_id`, or by a
+  # pasted https://mdblist.com/lists/... URL.
+  # trending_movies:
+  #   type: mdblist
+  #   list: someuser/trending-movies
+  #   ttl: 12h
+  #   media_type: movie      # any | movie | show
+  #   limit: 500
+
+  # What a Radarr or Sonarr instance already has.
+  # my_radarr:
+  #   type: radarr
+  #   url: http://radarr:7878
+  #   api_key: ${RADARR_API_KEY}
+  #   monitored_only: false
+  # my_sonarr:
+  #   type: sonarr
+  #   url: http://sonarr:8989
+  #   api_key: ${SONARR_API_KEY}
+
+  # Any JSON feed. `fields` is optional - common spellings are tried by default.
+  # stevenlu:
+  #   type: json
+  #   url: https://popular-movies-data.stevenlu.com/movies.json
+  #   media_type: movie
+  #   fields:
+  #     imdb: imdb_id
+
+  # Ids written straight into the config - handy as a never-grab list.
+  never:
+    type: static
+    media_type: movie
+    items:
+      - tmdb:550
+
+lists:
+  # wanted_movies:
+  #   expr: "(trending_movies | top250) - my_radarr - never"
+  #   media_type: movie      # any | movie | show
+  #   min_year: 1990
+  #   sort: rank             # none | rank | title | year | released | random
+  #   order: asc             # asc | desc
+  #   limit: 200
+  #   kometa:
+  #     collection: Wanted Movies
+  #     sync_mode: sync
+  #     collection_order: custom
+  example:
+    expr: "never"
+    media_type: movie

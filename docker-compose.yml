@@ -1,0 +1,21 @@
+services:
+  repsetarr:
+    build: .
+    image: repsetarr:local
+    container_name: repsetarr
+    ports:
+      - "9797:9797"
+    volumes:
+      # On Unraid keep this on the cache disk, not a /mnt/user share.
+      - /mnt/cache/appdata/repsetarr:/config
+    environment:
+      PUID: "99"          # Unraid nobody:users
+      PGID: "100"
+      UMASK: "002"
+      TZ: ${TZ:-Etc/UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Referenced from config.yml as ${MDBLIST_API_KEY} and friends.
+      MDBLIST_API_KEY: ${MDBLIST_API_KEY:-}
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+    restart: unless-stopped
