@@ -1,0 +1,152 @@
+# Images live at ghcr.io/<owner>/repsetarr
+#
+#   main push / manual "dev"  →  0.1.0-dev.<sha>   tags: that version, `dev`
+#   manual current|patch|minor|major
+#                             →  0.1.1             tags: that version, `latest`
+#
+# Cargo.toml is the last cut release. Hashed versions are bake-time only.
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: >
+          "dev" rebuilds this commit as a hashed image (moves the `dev` tag).
+          "current" publishes Cargo.toml as-is (moves `latest`).
+          patch / minor / major bumps the crate, tags vX.Y.Z, and
+          publishes that clean version as `latest`.
+        type: choice
+        options: [dev, current, patch, minor, major]
+        default: dev
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    name: Build and push
+    runs-on: ubuntu-latest
+    # A release commit is built by the dispatch that created it, not again as `dev`.
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release:')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Require main for a release
+        if: github.event_name == 'workflow_dispatch' && inputs.bump != 'dev'
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Releases must be cut from main (this run is on ${GITHUB_REF_NAME})" >&2
+            exit 1
+          fi
+
+      - name: Bump the released version
+        id: release
+        if: github.event_name == 'workflow_dispatch' && inputs.bump != 'dev'
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          version="$(scripts/bump-version.sh "$BUMP")"
+
+          if [ "$BUMP" != "current" ]; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "release: ${version}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image version
+        id: version
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_REVISION: ${{ steps.release.outputs.revision }}
+        run: |
+          set -euo pipefail
+          base="$(scripts/bump-version.sh current)"
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          if [ -n "${RELEASE_VERSION}" ]; then
+            echo "channel=release" >> "$GITHUB_OUTPUT"
+            echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "revision=${RELEASE_REVISION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+            echo "version=${base}-dev.${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "revision=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/repsetarr" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.version.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=dev,enable=${{ steps.version.outputs.channel == 'dev' }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.channel == 'release' }}
+          labels: |
+            org.opencontainers.image.title=Repsetarr
+            org.opencontainers.image.description=Set algebra for movie and show lists
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.revision=${{ steps.version.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            GIT_SHA=${{ steps.version.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Tag and publish GitHub Release
+        if: steps.version.outputs.channel == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "Git tag ${tag} already exists; image ${IMAGE}:${VERSION} was republished."
+            exit 0
+          fi
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"
+          gh release create "$tag" --title "$tag" --generate-notes

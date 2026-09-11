@@ -26,7 +26,14 @@ COPY config.example.yml /usr/local/share/repsetarr/config.example.yml
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENV REPSETARR_CONFIG=/config/config.yml \
+# Stamped by CI so the running image can name itself; declared after the build
+# stages so a new version never invalidates the compile cache.
+ARG APP_VERSION=dev
+ARG GIT_SHA=unknown
+
+ENV APP_VERSION=${APP_VERSION} \
+    GIT_SHA=${GIT_SHA} \
+    REPSETARR_CONFIG=/config/config.yml \
     PUID=99 \
     PGID=100 \
     UMASK=002 \
