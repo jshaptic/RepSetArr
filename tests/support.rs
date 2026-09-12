@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use repsetarr::cache::CacheStore;
+use repsetarr::meta::MetaStore;
 use repsetarr::state::{AppState, SharedState};
 use repsetarr::{api, config, refresh};
 use tower::ServiceExt;
@@ -23,7 +24,11 @@ pub async fn state_at(yaml: &str, path: PathBuf) -> SharedState {
         std::env::temp_dir().join("repsetarr-tests"),
         false,
     ));
-    let state: SharedState = Arc::new(AppState::new(runtime, cache, reqwest::Client::new()));
+    let meta = Arc::new(MetaStore::new(
+        std::env::temp_dir().join("repsetarr-tests"),
+        false,
+    ));
+    let state: SharedState = Arc::new(AppState::new(runtime, cache, meta, reqwest::Client::new()));
     refresh::prime(&state).await;
     state
 }

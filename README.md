@@ -28,7 +28,7 @@ other people's lists to a new list.
 ```yaml
 lists:
   wanted_movies:
-    expr: "(trending | top250) - my_radarr - never"
+    list_formula: "(trending | top250) - my_radarr - never"
 ```
 
 That list is then an import list URL in Radarr, or a collection file URL in Kometa. There is
@@ -71,10 +71,10 @@ A list may reference another list by name, so expressions compose:
 ```yaml
 lists:
   shortlist:
-    expr: "trending | top250"
+    list_formula: "trending | top250"
     limit: 100
   to_grab:
-    expr: "shortlist - my_radarr"    # sees the first 100, after the limit
+    list_formula: "shortlist - my_radarr"   # sees the first 100, after the limit
 ```
 
 Names are bare words. Because `-` is an operator, **a name containing a dash must be
@@ -143,7 +143,8 @@ sources:
 
 | Option | Default | What it does |
 |---|---|---|
-| `expr` | *(required)* | The set expression |
+| `list_formula` | *(required)* | The set algebra over sources and lists |
+| `filter` | - | Boolean algebra over names from `filters:` (see below) |
 | `media_type` | `any` | Keep only `movie` or only `show` |
 | `min_year` / `max_year` | - | Filter on release year |
 | `released_after` / `released_before` | - | Filter on release date (`YYYY-MM-DD`) |
@@ -159,6 +160,96 @@ Filters, sort and limit run **after** the algebra, and a list referenced from an
 expression contributes its post-processed contents. With `sort: none` the order is the one
 the algebra produced: a union keeps the left side's order and appends what is new on the
 right, so a source's own ranking survives.
+
+### Filters
+
+The algebra decides *which lists* an item comes from. Filters decide *what the item is*.
+They are two separate languages on purpose: a set operand is a finite collection, a filter is
+a predicate with no extent of its own, and writing `russian` where a source name belongs
+would read like a set that has to be fetched from somewhere.
+
+Define named blocks under `filters:`, then apply them per list with `filter:`:
+
+```yaml
+filters:
+  russian:
+    country: ru, su          # comma-separated values are alternatives
+  kids_safe:
+    content_rating: G, PG    # every line in a block must hold
+    runtime.lte: 100
+  animation:
+    genre: animation
+
+lists:
+  ru_kids:
+    list_formula: "curated_3_5 & russian_content"   # set algebra
+    filter: "russian and (kids_safe or animation)"  # boolean algebra
+```
+
+Note that `filter:` holds an *expression*, not a single filter name: `and`, `or`, `not` and
+brackets, with `not` binding tightest and `and` before `or`. `&&`, `||` and `!` work too; a
+bare `&` or `|` is rejected with a note that it belongs in `list_formula:`.
+
+**Attributes and their modifiers.** Naming follows Kometa/TMDb, so `content_rating` and
+`original_language` are spelled the way you have seen them elsewhere.
+
+| Attribute | Modifiers |
+|---|---|
+| `country`, `original_language`, `spoken_language`, `content_rating`, `status`, `type` | bare = any of, `.not` |
+| `genre` | bare = any of, `.not`, `.all` |
+| `runtime`, `year` | bare = equals, `.gt`, `.gte`, `.lt`, `.lte` |
+| `release` | `.before`, `.after` (bare means `.after`) |
+| `title` | bare = contains, `.not`, `.begins`, `.ends`, `.regex` |
+
+`language`, `genres`, `certification`, `released` and `media_type` are accepted as aliases.
+An unknown attribute or modifier is a config error, reported with the alternatives.
+
+**When the attribute is not known.** A line whose attribute the item does not carry answers
+`unknown:`, which defaults to `exclude` - the same way `min_year` already drops items that
+have no year. Set `unknown: include` per block to keep them instead. Note the consequence:
+`country.not: us` fails for an item of unknown country, because neither "it is US" nor "it is
+not US" can be shown; but `not russian` in a list's `filter:` *admits* that item, because the
+inner block was false. Two-valued logic, no surprises hiding in a third state.
+
+### Where attributes come from
+
+MDBList list items already carry `country`, `language`, `spoken_language`, `runtime`,
+`status` and (on request) `genres` in the payload Repsetarr fetches anyway, so filtering an
+MDBList-backed list costs **nothing extra**. Items merged from several sources share what
+any one of them knew: a title that is both in an MDBList list and in your Radarr library
+gets its country from the former.
+
+Everything else - Radarr, Sonarr, static blocks, JSON feeds without the fields - is filled in
+by a background enricher, batched 200 ids to a request against MDBList's media-info endpoint
+and remembered in `<cache.dir>/metadata.json`.
+
+Three things keep that cheap:
+
+- only attributes some `filter:` actually reads are fetched, so a config with no `filters:`
+  makes no requests at all;
+- only sources feeding a filtered list are considered;
+- ids that came back empty are remembered as such, so a title the provider has never heard of
+  is not asked about again tomorrow.
+
+A cold 5,000-title Radarr library costs about 25 requests, once; steady state is zero. The
+default TTL is 30 days because a film's country of origin does not change.
+
+```yaml
+metadata:
+  enabled: true
+  ttl: 30d          # positive answers
+  miss_ttl: 7d      # "never heard of it" answers
+  budget: 2000      # most requests one enrichment pass may make
+  reserve: 1000     # stop when the daily allowance drops below this
+```
+
+It needs `providers.mdblist.apikey`. Nothing is ever fetched while serving a request: a list
+whose metadata is not warm yet is answered from what is known, and the response says so with
+`X-Repsetarr-Unenriched`.
+
+Two things worth knowing about the data itself. MDBList reports **one** country per title, so
+a co-production shows whichever it picked; and Soviet-era films are filed under `su`, not
+`ru` - hence `country: ru, su`. Filtering on `original_language` is often steadier.
 
 ### Server and cache
 
@@ -197,7 +288,9 @@ cache:
 | `POST /api/reload` | Re-read the config file |
 
 Responses carry `X-Repsetarr-Count`, `X-Repsetarr-Skipped` (items the consumer's format could
-not represent) and `X-Repsetarr-Stale` (sources serving data past its TTL).
+not represent), `X-Repsetarr-Stale` (sources serving data past its TTL) and
+`X-Repsetarr-Unenriched` (candidates a filter had to judge without knowing every attribute it
+reads - the answer is provisional until the enricher catches up).
 
 An unknown list is a `404`. A list whose source has never been fetched successfully is a
 `503` - the list is fine, the data behind it just is not here yet.

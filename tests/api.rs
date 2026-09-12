@@ -25,13 +25,13 @@ sources:
     items: ["tvdb:81189", "tmdb:1399"]
 lists:
   wanted_movies:
-    expr: "trending - owned"
+    list_formula: "trending - owned"
     media_type: movie
   wanted_shows:
-    expr: "shows"
+    list_formula: "shows"
     media_type: show
   everything:
-    expr: "wanted_movies | shows"
+    list_formula: "wanted_movies | shows"
 "#;
 
 #[tokio::test]
@@ -108,7 +108,7 @@ sources:
     url: http://127.0.0.1:1/list.json
 lists:
   broken:
-    expr: "unreachable"
+    list_formula: "unreachable"
 "#,
     )
     .await;
@@ -176,10 +176,10 @@ sources:
     items: ["tmdb:3", "tmdb:4"]
 lists:
   first_two:
-    expr: "all"
+    list_formula: "all"
     limit: 2
   first_two_minus_some:
-    expr: "first_two - some"
+    list_formula: "first_two - some"
 "#,
     )
     .await;
@@ -209,7 +209,7 @@ sources:
     items: ["imdb:tt0137523"]
 lists:
   wanted:
-    expr: "by_tmdb - by_imdb"
+    list_formula: "by_tmdb - by_imdb"
 "#,
     )
     .await;
@@ -231,7 +231,7 @@ async fn reload_picks_up_a_changed_file_and_refuses_a_broken_one() {
 
     std::fs::write(
         &path,
-        format!("{CONFIG}  added:\n    expr: \"trending\"\n    media_type: movie\n"),
+        format!("{CONFIG}  added:\n    list_formula: \"trending\"\n    media_type: movie\n"),
     )
     .unwrap();
     let reply = post(&state, "/api/reload").await;
@@ -243,7 +243,11 @@ async fn reload_picks_up_a_changed_file_and_refuses_a_broken_one() {
     assert_eq!(added.status, StatusCode::OK);
     assert_eq!(added.json(), json!([{"id": 550}, {"id": 603}, {"id": 13}]));
 
-    std::fs::write(&path, "lists:\n  broken: { expr: \"nothing_here\" }\n").unwrap();
+    std::fs::write(
+        &path,
+        "lists:\n  broken: { list_formula: \"nothing_here\" }\n",
+    )
+    .unwrap();
     let reply = post(&state, "/api/reload").await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert!(reply.body.contains("nothing_here"), "{}", reply.body);

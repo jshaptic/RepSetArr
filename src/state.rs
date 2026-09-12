@@ -9,23 +9,31 @@ use chrono::{DateTime, Utc};
 
 use crate::cache::CacheStore;
 use crate::config::{self, Runtime};
+use crate::meta::MetaStore;
 
 pub type SharedState = Arc<AppState>;
 
 pub struct AppState {
     runtime: ArcSwap<Runtime>,
     pub cache: Arc<CacheStore>,
+    pub meta: Arc<MetaStore>,
     pub http: reqwest::Client,
     pub config_path: PathBuf,
     pub started_at: DateTime<Utc>,
 }
 
 impl AppState {
-    pub fn new(runtime: Runtime, cache: Arc<CacheStore>, http: reqwest::Client) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        cache: Arc<CacheStore>,
+        meta: Arc<MetaStore>,
+        http: reqwest::Client,
+    ) -> Self {
         AppState {
             config_path: runtime.path.clone(),
             runtime: ArcSwap::from_pointee(runtime),
             cache,
+            meta,
             http,
             started_at: Utc::now(),
         }

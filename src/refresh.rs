@@ -12,6 +12,7 @@ use tokio::task::JoinSet;
 
 use crate::cache::{self, CacheStore};
 use crate::config::Runtime;
+use crate::enrich;
 use crate::sources;
 use crate::state::SharedState;
 
@@ -62,6 +63,7 @@ pub async fn prime(state: &SharedState) {
             state.cache.restore(name, &cache::fingerprint(source)).await;
         }
     }
+    enrich::prime(state).await;
     refresh_due(state).await;
 }
 
@@ -76,6 +78,8 @@ pub async fn refresh_due(state: &SharedState) {
         .cloned()
         .collect();
     if names.is_empty() {
+        // Sources may be warm while a newly added filter still needs metadata.
+        enrich::enrich_due(state).await;
         return;
     }
 
@@ -101,6 +105,9 @@ pub async fn refresh_due(state: &SharedState) {
         }
         running -= 1;
     }
+
+    // Enrichment reads the snapshots this pass just wrote, so it comes after.
+    enrich::enrich_due(state).await;
 }
 
 /// The supervisor loop. Runs until the process exits.

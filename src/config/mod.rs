@@ -2,7 +2,7 @@
 
 pub mod model;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::expr::{self, Expr};
+use crate::filter::{self, Attribute, Condition, FilterDef, Program};
 use crate::model::parse_id_spec;
 pub use model::*;
 
@@ -22,6 +23,8 @@ pub struct Runtime {
     pub lists: IndexMap<String, CompiledList>,
     /// All lists in dependency order, dependencies first.
     pub list_order: Vec<String>,
+    /// Named filter blocks, shared by every list that references them.
+    pub filters: IndexMap<String, Arc<FilterDef>>,
 }
 
 #[derive(Debug)]
@@ -32,6 +35,11 @@ pub struct CompiledList {
     pub list_deps: Vec<String>,
     /// Sources this list needs, transitively.
     pub source_deps: Vec<String>,
+    /// The compiled `filter:` expression, names already resolved.
+    pub filter: Option<Program>,
+    /// Attributes this list reads, including those its dependencies read.
+    /// The enricher fetches exactly this much and no more.
+    pub required_attrs: BTreeSet<Attribute>,
 }
 
 impl Runtime {
@@ -58,6 +66,22 @@ impl Runtime {
                 .as_ref()
                 .map(|provider| provider.apikey.clone())
         })
+    }
+
+    /// A key for enrichment, which is not tied to any one list: the provider
+    /// block if there is one, else borrowed from whichever MDBList source has
+    /// one, since that key already works against the same API.
+    pub fn mdblist_any_apikey(&self) -> Option<String> {
+        if let Some(provider) = &self.config.providers.mdblist {
+            return Some(provider.apikey.clone());
+        }
+        self.config
+            .sources
+            .values()
+            .find_map(|source| match source {
+                SourceConfig::Mdblist(mdblist) => mdblist.apikey.clone(),
+                _ => None,
+            })
     }
 
     pub fn mdblist_base_url(&self) -> String {
@@ -207,15 +231,64 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
         validate_list_options(name, list, &mut problems);
     }
 
+    // Filter blocks first: a list's `filter:` can only be resolved once the
+    // names it might reference are known.
+    let mut filters: IndexMap<String, Arc<FilterDef>> = IndexMap::new();
+    for (name, block) in &config.filters {
+        let mut conditions = Vec::new();
+        for (key, value) in &block.conditions {
+            match Condition::parse(key, value) {
+                Ok(condition) => conditions.push(condition),
+                Err(error) => problems.push(format!("filter `{name}`: {error}")),
+            }
+        }
+        if block.conditions.is_empty() {
+            problems.push(format!(
+                "filter `{name}`: no conditions, so it would match everything"
+            ));
+        }
+        filters.insert(
+            name.clone(),
+            Arc::new(FilterDef {
+                name: name.clone(),
+                conditions,
+                unknown: block.unknown,
+            }),
+        );
+    }
+
+    let mut parsed_filters: IndexMap<String, filter::BoolExpr> = IndexMap::new();
+    for (name, list) in &config.lists {
+        let Some(text) = &list.filter else {
+            continue;
+        };
+        match filter::parse(text) {
+            Ok(expression) => {
+                for referenced in expression.names() {
+                    if !config.filters.contains_key(referenced) {
+                        problems.push(format!(
+                            "list `{name}`: `{referenced}` is not defined under `filters:`{}",
+                            filter_hint(referenced, &config)
+                        ));
+                    }
+                }
+                parsed_filters.insert(name.clone(), expression);
+            }
+            Err(error) => problems.push(format!("list `{name}`: {error} in filter `{text}`")),
+        }
+    }
+
     // Parse every expression before resolving names so a syntax error does not
     // hide behind a name error.
     let mut parsed: IndexMap<String, Expr> = IndexMap::new();
     for (name, list) in &config.lists {
-        match expr::parse(&list.expr) {
+        match expr::parse(&list.list_formula) {
             Ok(expression) => {
                 parsed.insert(name.clone(), expression);
             }
-            Err(error) => problems.push(format!("list `{name}`: {error} in `{}`", list.expr)),
+            Err(error) => {
+                problems.push(format!("list `{name}`: {error} in `{}`", list.list_formula))
+            }
         }
     }
 
@@ -260,13 +333,33 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
                 }
             }
         }
+        let list_deps: Vec<String> = list_deps.into_iter().collect();
+
+        let program = match parsed_filters.get(name) {
+            Some(expression) => Some(Program::compile(expression, &filters)?),
+            None => None,
+        };
+        // A dependency list filters its own contents before this one sees them,
+        // so its attributes have to be fetched too.
+        let mut required_attrs: BTreeSet<Attribute> = program
+            .as_ref()
+            .map(Program::attributes)
+            .unwrap_or_default();
+        for dependency in &list_deps {
+            if let Some(dependency) = lists.get(dependency) {
+                required_attrs.extend(dependency.required_attrs.iter().copied());
+            }
+        }
+
         lists.insert(
             name.clone(),
             CompiledList {
                 name: name.clone(),
                 expr: expression.clone(),
-                list_deps: list_deps.into_iter().collect(),
+                list_deps,
                 source_deps: source_deps.into_iter().collect(),
+                filter: program,
+                required_attrs,
             },
         );
     }
@@ -276,6 +369,7 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
         config: Arc::new(config),
         lists,
         list_order: order,
+        filters,
     })
 }
 
@@ -380,6 +474,17 @@ fn dash_hint(referenced: &str, config: &Config) -> String {
     }
 }
 
+/// The common mistake is reaching for the set language inside `filter:`.
+fn filter_hint(referenced: &str, config: &Config) -> String {
+    if config.sources.contains_key(referenced) || config.lists.contains_key(referenced) {
+        return format!(
+            " (`{referenced}` is a source or list - those belong in `list_formula:`, \
+             not `filter:`)"
+        );
+    }
+    String::new()
+}
+
 /// Dependency-first ordering of lists, reporting any cycle it finds.
 fn topological_order(
     parsed: &IndexMap<String, Expr>,
@@ -464,6 +569,7 @@ fn quoted_list(values: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::UnknownPolicy;
 
     fn compile_str(raw: &str) -> Result<Runtime> {
         let config = parse_str(raw)?;
@@ -487,9 +593,9 @@ sources:
     items: ["tmdb:2"]
 lists:
   wanted:
-    expr: "trending - owned"
+    list_formula: "trending - owned"
   wanted_top:
-    expr: "wanted & trending"
+    list_formula: "wanted & trending"
     limit: 10
 "#;
 
@@ -578,7 +684,7 @@ lists: {}
 sources:
   a: { type: static, items: ["tmdb:1"] }
 lists:
-  bad: { expr: "a - ghost" }
+  bad: { list_formula: "a - ghost" }
 "#,
         );
         assert!(error.contains("`ghost`"), "{error}");
@@ -591,7 +697,7 @@ lists:
 sources:
   top-250: { type: static, items: ["tmdb:1"] }
 lists:
-  bad: { expr: "top-250" }
+  bad: { list_formula: "top-250" }
 "#,
         );
         assert!(error.contains("quote it as"), "{error}");
@@ -604,8 +710,8 @@ lists:
 sources:
   a: { type: static, items: ["tmdb:1"] }
 lists:
-  one: { expr: "a | two" }
-  two: { expr: "a | one" }
+  one: { list_formula: "a | two" }
+  two: { list_formula: "a | one" }
 "#,
         );
         assert!(error.contains("cycle"), "{error}");
@@ -618,7 +724,7 @@ lists:
 sources:
   same: { type: static, items: ["tmdb:1"] }
 lists:
-  same: { expr: "same" }
+  same: { list_formula: "same" }
 "#,
         );
         assert!(error.contains("names must be unique"), "{error}");
@@ -631,7 +737,7 @@ lists:
 sources:
   a: { type: static, items: ["tmdb:1"] }
 lists:
-  bad: { expr: "a - " }
+  bad: { list_formula: "a - " }
 "#,
         );
         assert!(error.contains("list `bad`"), "{error}");
@@ -698,8 +804,8 @@ lists: {}
 sources:
   a: { type: static, items: [] }
 lists:
-  one: { expr: "ghost" }
-  two: { expr: "a - " }
+  one: { list_formula: "ghost" }
+  two: { list_formula: "a - " }
 "#,
         );
         assert!(error.contains("3 problem(s)"), "{error}");
@@ -712,10 +818,120 @@ lists:
 sources:
   a: { type: static, items: ["tmdb:1"] }
 lists:
-  bad: { expr: "a", min_year: 2020, max_year: 2000, limit: 0 }
+  bad: { list_formula: "a", min_year: 2020, max_year: 2000, limit: 0 }
 "#,
         );
         assert!(error.contains("min_year"), "{error}");
         assert!(error.contains("limit: 0"), "{error}");
+    }
+
+    const FILTERED: &str = r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+  b: { type: static, items: ["tmdb:2"] }
+filters:
+  russian:
+    country: ru, su
+    unknown: include
+  animation:
+    genre: animation
+  feature_length:
+    runtime.gte: 70
+lists:
+  base:
+    list_formula: "a"
+    filter: "russian"
+  combined:
+    list_formula: "base | b"
+    filter: "animation and not feature_length"
+"#;
+
+    /// It is written to disk on first boot and loaded straight back, so a
+    /// broken one breaks the very first run.
+    #[test]
+    fn the_shipped_starter_config_is_valid() {
+        let raw = include_str!("../../config.example.yml");
+        compile_str(raw).expect("the starter config compiles");
+    }
+
+    #[test]
+    fn filters_compile_and_their_attributes_are_collected() {
+        let runtime = compile_str(FILTERED).expect("compiles");
+        assert_eq!(runtime.filters.len(), 3);
+        assert_eq!(runtime.filters["russian"].unknown, UnknownPolicy::Include);
+        assert_eq!(runtime.filters["animation"].unknown, UnknownPolicy::Exclude);
+
+        let base = runtime.list("base").expect("base exists");
+        assert_eq!(
+            base.required_attrs.iter().copied().collect::<Vec<_>>(),
+            vec![Attribute::Country]
+        );
+
+        // A dependency filters its own contents first, so its attributes have
+        // to be fetched too or `combined` would be built from a wrong `base`.
+        let combined = runtime.list("combined").expect("combined exists");
+        let attributes: Vec<Attribute> = combined.required_attrs.iter().copied().collect();
+        assert!(attributes.contains(&Attribute::Country), "{attributes:?}");
+        assert!(attributes.contains(&Attribute::Genre), "{attributes:?}");
+        assert!(attributes.contains(&Attribute::Runtime), "{attributes:?}");
+    }
+
+    #[test]
+    fn a_list_without_a_filter_needs_no_metadata() {
+        let runtime = compile_str(SAMPLE).expect("compiles");
+        assert!(runtime.filters.is_empty());
+        assert!(
+            runtime
+                .lists
+                .values()
+                .all(|list| list.required_attrs.is_empty())
+        );
+    }
+
+    #[test]
+    fn filter_problems_are_reported_with_everything_else() {
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+filters:
+  broken:
+    countryy: ru
+  empty: {}
+lists:
+  bad: { list_formula: "a", filter: "broken and ghost" }
+"#,
+        );
+        assert!(error.contains("unknown filter attribute"), "{error}");
+        assert!(error.contains("match everything"), "{error}");
+        assert!(error.contains("`ghost`"), "{error}");
+    }
+
+    #[test]
+    fn reaching_for_the_set_language_inside_a_filter_says_so() {
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+filters:
+  russian: { country: ru }
+lists:
+  bad: { list_formula: "a", filter: "russian and a" }
+"#,
+        );
+        assert!(error.contains("belong in `list_formula:`"), "{error}");
+
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+filters:
+  russian: { country: ru }
+  kids: { content_rating: G }
+lists:
+  bad: { list_formula: "a", filter: "russian & kids" }
+"#,
+        );
+        assert!(error.contains("set operator"), "{error}");
     }
 }

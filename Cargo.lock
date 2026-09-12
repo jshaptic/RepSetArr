@@ -1270,6 +1270,7 @@ dependencies = [
  "indexmap",
  "notify",
  "rand",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

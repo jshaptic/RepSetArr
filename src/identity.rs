@@ -106,6 +106,13 @@ impl Interner {
         &self.items[group]
     }
 
+    /// Every interned item, so a later pass can fill in what the sources did
+    /// not carry. Non-root slots are visited too, which is harmless: only roots
+    /// are ever read back through [`Interner::item`].
+    pub fn items_mut(&mut self) -> impl Iterator<Item = &mut Item> {
+        self.items.iter_mut()
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }

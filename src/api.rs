@@ -100,7 +100,8 @@ async fn index(State(state): State<SharedState>) -> Json<Value> {
             let compiled = runtime.list(name);
             let mut entry = json!({
                 "name": name,
-                "expr": config.expr,
+                "list_formula": config.list_formula,
+                "filter": config.filter,
                 "media_type": media_type_label(config.media_type),
                 "sources": compiled.map(|list| list.source_deps.clone()).unwrap_or_default(),
                 "endpoints": {
@@ -109,13 +110,14 @@ async fn index(State(state): State<SharedState>) -> Json<Value> {
                     "kometa": format!("/api/lists/{name}/kometa.yml"),
                 },
             });
-            match lists::evaluate(&runtime, &state.cache, name) {
+            match lists::evaluate(&runtime, &state.cache, &state.meta, name) {
                 Ok(evaluation) => {
                     let movies = count(&evaluation.items, MediaType::Movie);
                     entry["items"] = json!(evaluation.items.len());
                     entry["movies"] = json!(movies);
                     entry["shows"] = json!(evaluation.items.len() - movies);
                     entry["stale_sources"] = json!(evaluation.stale_sources);
+                    entry["unenriched"] = json!(evaluation.unenriched);
                     entry["evaluated_at"] = json!(evaluation.evaluated_at);
                 }
                 Err(error) => entry["error"] = json!(format!("{error}")),
@@ -183,7 +185,7 @@ async fn kometa(
 
 fn evaluate(state: &SharedState, name: &str) -> Result<Evaluation, ApiError> {
     let runtime = state.runtime();
-    Ok(lists::evaluate(&runtime, &state.cache, name)?)
+    Ok(lists::evaluate(&runtime, &state.cache, &state.meta, name)?)
 }
 
 fn headers(evaluation: &Evaluation, returned: usize, skipped: usize) -> HeaderMap {
@@ -196,6 +198,13 @@ fn headers(evaluation: &Evaluation, returned: usize, skipped: usize) -> HeaderMa
         headers.insert(
             "X-Repsetarr-Skipped",
             HeaderValue::from_str(&skipped.to_string()).expect("a number is a valid header"),
+        );
+    }
+    if evaluation.unenriched > 0 {
+        headers.insert(
+            "X-Repsetarr-Unenriched",
+            HeaderValue::from_str(&evaluation.unenriched.to_string())
+                .expect("a number is a valid header"),
         );
     }
     if !evaluation.stale_sources.is_empty()
@@ -426,7 +435,7 @@ mod tests {
     }
 
     fn list_config() -> ListConfig {
-        serde_yaml_ng::from_str("expr: a").unwrap()
+        serde_yaml_ng::from_str("list_formula: a").unwrap()
     }
 
     #[test]

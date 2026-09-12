@@ -6,9 +6,9 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::json_value::{as_date, as_i32, as_str, as_u32, dig, first_present};
-use crate::config::JsonSource;
-use crate::model::{Item, MediaType, normalize_imdb};
+use super::json_value::{as_date, as_genres, as_i32, as_str, as_u32, dig, first_present};
+use crate::config::{FieldMap, JsonSource};
+use crate::model::{Attrs, Item, MediaType, normalize_code, normalize_imdb};
 
 pub async fn fetch(http: &reqwest::Client, source: &JsonSource) -> Result<Vec<Item>> {
     let mut request = http.get(&source.url);
@@ -70,15 +70,29 @@ pub fn parse(document: &Value, source: &JsonSource) -> Result<Vec<Item>> {
 
             item.title = as_str(first_present(entry, &fields.title_keys())).map(str::to_string);
             item.year = as_i32(first_present(entry, &fields.year_keys()));
-            item.released = as_date(first_present(
-                entry,
-                &["released", "release_date", "digitalRelease"],
-            ));
+            item.released = as_date(first_present(entry, &fields.released_keys()));
             item.rank = Some(index as u32 + 1);
+            item.attrs = attrs(entry, fields);
             Some(item)
         })
         .collect();
     Ok(items)
+}
+
+/// Descriptive fields, if the feed happens to carry any. A feed that does not
+/// leaves the gaps for the enricher.
+fn attrs(entry: &Value, fields: &FieldMap) -> Attrs {
+    let code = |keys: &[&str]| as_str(first_present(entry, keys)).and_then(normalize_code);
+    Attrs {
+        country: code(&fields.country_keys()),
+        original_language: code(&fields.original_language_keys()),
+        spoken_language: code(&fields.spoken_language_keys()),
+        genres: as_genres(first_present(entry, &fields.genres_keys())),
+        runtime: as_u32(first_present(entry, &fields.runtime_keys())).filter(|m| *m > 0),
+        content_rating: as_str(first_present(entry, &fields.content_rating_keys()))
+            .map(|text| text.to_ascii_uppercase()),
+        status: code(&fields.status_keys()),
+    }
 }
 
 fn kind_of(value: &Value) -> &'static str {

@@ -33,6 +33,29 @@ pub fn as_date(value: Option<&Value>) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&text[..text.len().min(10)], "%Y-%m-%d").ok()
 }
 
+/// Genres arrive either as plain strings (`["drama"]`, from the list endpoint)
+/// or as objects (`[{"id":6,"title":"Drama"}]`, from the batch endpoint).
+/// Normalized to lowercase names, deduplicated, order preserved.
+pub fn as_genres(value: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(entries)) = value else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = match entry {
+            Value::String(_) => as_str(Some(entry)),
+            Value::Object(_) => as_str(first_present(entry, &["title", "name", "genre"])),
+            _ => None,
+        };
+        if let Some(name) = name.and_then(crate::model::normalize_code)
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Look up the first key that is present, so a feed can spell it `tmdbId`,
 /// `tmdb_id` or `tmdb`.
 pub fn first_present<'a>(object: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -69,6 +92,22 @@ mod tests {
             NaiveDate::from_ymd_opt(1999, 10, 15)
         );
         assert_eq!(as_date(Some(&json!("not a date"))), None);
+    }
+
+    #[test]
+    fn genres_normalize_from_both_shapes() {
+        assert_eq!(
+            as_genres(Some(&json!(["Drama", "War"]))),
+            vec!["drama".to_string(), "war".to_string()]
+        );
+        assert_eq!(
+            as_genres(Some(
+                &json!([{"id": 6, "title": "Drama"}, {"title": "drama"}])
+            )),
+            vec!["drama".to_string()]
+        );
+        assert!(as_genres(Some(&json!(null))).is_empty());
+        assert!(as_genres(None).is_empty());
     }
 
     #[test]

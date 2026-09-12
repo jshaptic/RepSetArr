@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use repsetarr::cache::CacheStore;
+use repsetarr::meta::MetaStore;
 use repsetarr::state::{AppState, SharedState};
 use repsetarr::{api, config, refresh};
 use tracing_subscriber::EnvFilter;
@@ -37,6 +38,12 @@ async fn main() -> Result<()> {
         runtime.config.cache.dir.clone(),
         runtime.config.cache.persist,
     ));
+    // Metadata lives beside the snapshots: same directory, same persistence
+    // switch, but one file for every title rather than one file per source.
+    let meta = Arc::new(MetaStore::new(
+        runtime.config.cache.dir.clone(),
+        runtime.config.cache.persist,
+    ));
     let http = reqwest::Client::builder()
         .user_agent(concat!("Repsetarr/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(60))
@@ -52,7 +59,7 @@ async fn main() -> Result<()> {
         "starting"
     );
 
-    let state: SharedState = Arc::new(AppState::new(runtime, cache, http));
+    let state: SharedState = Arc::new(AppState::new(runtime, cache, meta, http));
 
     // Seed from disk and fetch anything missing before answering requests.
     refresh::prime(&state).await;

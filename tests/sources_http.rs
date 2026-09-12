@@ -55,9 +55,9 @@ sources:
     list: someuser/trending
 lists:
   all:
-    expr: "trending"
+    list_formula: "trending"
   movies:
-    expr: "trending"
+    list_formula: "trending"
     media_type: movie
 "#,
         uri = server.uri()
@@ -99,7 +99,7 @@ sources:
     list_id: 42
 lists:
   all:
-    expr: "trending"
+    list_formula: "trending"
 "#,
         uri = server.uri()
     ))
@@ -147,7 +147,7 @@ sources:
     items: ["imdb:tt0137523"]
 lists:
   unseen:
-    expr: "(wanted | bridge) - seen"
+    list_formula: "(wanted | bridge) - seen"
 "#,
         uri = server.uri()
     ))
@@ -190,7 +190,7 @@ sources:
     items: ["tmdb:550", "tmdb:603", "tmdb:348"]
 lists:
   missing:
-    expr: "shortlist - my_radarr"
+    list_formula: "shortlist - my_radarr"
 "#,
         uri = server.uri()
     ))
@@ -236,7 +236,7 @@ sources:
       title: label
 lists:
   all:
-    expr: "feed"
+    list_formula: "feed"
 "#,
         uri = server.uri()
     ))

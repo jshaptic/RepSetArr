@@ -8,6 +8,7 @@ use chrono::NaiveDate;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use crate::filter::UnknownPolicy;
 use crate::model::MediaType;
 
 /// Keys serde did not recognize. They are collected rather than ignored so that
@@ -34,9 +35,77 @@ pub struct Config {
     #[serde(default)]
     pub providers: Providers,
     #[serde(default)]
+    pub metadata: MetadataConfig,
+    #[serde(default)]
     pub sources: IndexMap<String, SourceConfig>,
     #[serde(default)]
+    pub filters: IndexMap<String, FilterBlock>,
+    #[serde(default)]
     pub lists: IndexMap<String, ListConfig>,
+}
+
+/// A named block of filter conditions. Every key other than `unknown` is an
+/// `attribute[.modifier]` line; they are validated in `compile`, not here,
+/// because serde cannot say anything useful about `country.nto`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FilterBlock {
+    /// What a condition answers when the item does not know the attribute.
+    #[serde(default)]
+    pub unknown: UnknownPolicy,
+    #[serde(flatten)]
+    pub conditions: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+/// Backfilling attributes that sources do not carry, from a metadata provider.
+///
+/// Country, language and genre do not change once a title is released, so the
+/// TTL is long by design: the point is to ask once and then never again.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_metadata_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+    /// How long to remember that a provider had never heard of an id, so it is
+    /// not asked for again on every pass.
+    #[serde(default = "default_metadata_miss_ttl", with = "humantime_serde")]
+    pub miss_ttl: Duration,
+    /// Most requests one enrichment pass may make.
+    #[serde(default = "default_metadata_budget")]
+    pub budget: usize,
+    /// Stop early when the provider's remaining daily allowance drops below
+    /// this, leaving room for the list fetches that actually matter.
+    #[serde(default = "default_metadata_reserve")]
+    pub reserve: u64,
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        MetadataConfig {
+            enabled: true,
+            ttl: default_metadata_ttl(),
+            miss_ttl: default_metadata_miss_ttl(),
+            budget: default_metadata_budget(),
+            reserve: default_metadata_reserve(),
+        }
+    }
+}
+
+fn default_metadata_ttl() -> Duration {
+    Duration::from_secs(30 * 24 * 60 * 60)
+}
+
+fn default_metadata_miss_ttl() -> Duration {
+    Duration::from_secs(7 * 24 * 60 * 60)
+}
+
+fn default_metadata_budget() -> usize {
+    2_000
+}
+
+fn default_metadata_reserve() -> u64 {
+    1_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,8 +289,10 @@ pub struct JsonSource {
     /// Omit when the response is an array already.
     #[serde(default)]
     pub path: Option<String>,
+    /// Boxed: a dozen lists of candidate key names would otherwise make the
+    /// JSON variant dwarf every other kind of source.
     #[serde(default)]
-    pub fields: FieldMap,
+    pub fields: Box<FieldMap>,
     /// Media type for entries whose type field is missing or unmapped.
     #[serde(default)]
     pub media_type: MediaType,
@@ -250,6 +321,22 @@ pub struct FieldMap {
     pub year: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub media_type: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub released: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub country: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub original_language: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub spoken_language: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub genres: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub runtime: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub content_rating: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub status: Vec<String>,
 }
 
 impl FieldMap {
@@ -273,6 +360,39 @@ impl FieldMap {
     }
     pub fn media_type_keys(&self) -> Vec<&str> {
         pick(&self.media_type, &["mediatype", "media_type", "type"])
+    }
+    pub fn released_keys(&self) -> Vec<&str> {
+        pick(
+            &self.released,
+            &["released", "release_date", "digitalRelease"],
+        )
+    }
+    pub fn country_keys(&self) -> Vec<&str> {
+        pick(&self.country, &["country", "origin_country"])
+    }
+    pub fn original_language_keys(&self) -> Vec<&str> {
+        pick(
+            &self.original_language,
+            &["language", "original_language", "originalLanguage"],
+        )
+    }
+    pub fn spoken_language_keys(&self) -> Vec<&str> {
+        pick(&self.spoken_language, &["spoken_language"])
+    }
+    pub fn genres_keys(&self) -> Vec<&str> {
+        pick(&self.genres, &["genres", "genre"])
+    }
+    pub fn runtime_keys(&self) -> Vec<&str> {
+        pick(&self.runtime, &["runtime", "runtimeMinutes"])
+    }
+    pub fn content_rating_keys(&self) -> Vec<&str> {
+        pick(
+            &self.content_rating,
+            &["certification", "content_rating", "contentRating"],
+        )
+    }
+    pub fn status_keys(&self) -> Vec<&str> {
+        pick(&self.status, &["status"])
     }
 }
 
@@ -346,8 +466,13 @@ impl MediaTypeFilter {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListConfig {
-    /// The set expression, e.g. `(trending | top250) - my_radarr`.
-    pub expr: String,
+    /// Set algebra over sources and other lists,
+    /// e.g. `(trending | top250) - my_radarr`.
+    pub list_formula: String,
+    /// Boolean algebra over names from the top-level `filters:` block, e.g.
+    /// `russian and (kids_safe or animation)`. An expression, not one name.
+    #[serde(default)]
+    pub filter: Option<String>,
     #[serde(default)]
     pub media_type: MediaTypeFilter,
     #[serde(default)]

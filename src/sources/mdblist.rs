@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::json_value::{as_date, as_i32, as_str, as_u32};
+use super::json_value::{as_date, as_genres, as_i32, as_str, as_u32, first_present};
 use crate::config::{MdblistSource, MediaTypeFilter};
-use crate::model::{Item, MediaType, normalize_imdb};
+use crate::model::{Attrs, Item, MediaType, normalize_code, normalize_imdb};
 
 const PAGE_SIZE: usize = 1000;
 const MAX_PAGES: usize = 100;
@@ -106,6 +106,8 @@ pub async fn fetch(
                 ("apikey", apikey.to_string()),
                 ("limit", page_size.to_string()),
                 ("offset", offset.to_string()),
+                // Free: the same request, one more field per item.
+                ("append_to_response", "genres".to_string()),
             ])
             .send()
             .await
@@ -209,9 +211,28 @@ fn convert(hint: Option<MediaType>, raw: &Value, position: usize) -> Option<Item
 
     item.title = as_str(raw.get("title")).map(str::to_string);
     item.year = as_i32(raw.get("release_year")).or_else(|| as_i32(raw.get("year")));
-    item.released = as_date(raw.get("released"));
+    // The list endpoint spells it `release_date`; the media-info endpoint
+    // spells it `released`.
+    item.released = as_date(first_present(raw, &["release_date", "released"]));
     item.rank = as_u32(raw.get("rank")).or(Some(position as u32 + 1));
+    item.attrs = attrs_from_json(raw);
     Some(item)
+}
+
+/// The descriptive fields MDBList ships alongside the ids, in both the list-items
+/// and the media-info payloads. `certification` appears only in the latter.
+pub fn attrs_from_json(raw: &Value) -> Attrs {
+    Attrs {
+        country: as_str(raw.get("country")).and_then(normalize_code),
+        original_language: as_str(raw.get("language")).and_then(normalize_code),
+        spoken_language: as_str(raw.get("spoken_language")).and_then(normalize_code),
+        genres: as_genres(raw.get("genres")),
+        runtime: as_u32(raw.get("runtime")).filter(|minutes| *minutes > 0),
+        content_rating: as_str(raw.get("certification"))
+            .map(|text| text.trim().to_ascii_uppercase())
+            .filter(|text| !text.is_empty()),
+        status: as_str(raw.get("status")).and_then(normalize_code),
+    }
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -238,6 +259,77 @@ mod tests {
             ttl: None,
             extra: Default::default(),
         }
+    }
+
+    /// A real payload, captured from `GET /lists/{user}/{list}/items`.
+    #[test]
+    fn the_descriptive_fields_the_payload_already_carries_are_kept() {
+        let raw = json!({
+            "id": 25237,
+            "mediatype": "movie",
+            "imdb_id": "tt0091251",
+            "tvdb_id": 7042,
+            "ids": {"mdblist": "46w", "imdb": "tt0091251", "tmdb": 25237, "tvdb": 7042},
+            "title": "Come and See",
+            "language": "ru",
+            "spoken_language": "ru",
+            "country": "SU",
+            "genres": ["Drama", "War"],
+            "release_year": 1985,
+            "adult": 0,
+            "release_date": "1985-10-17",
+            "status": "Released",
+            "runtime": 142,
+            "rank": 1000
+        });
+
+        let item = convert(None, &raw, 0).expect("converts");
+        assert_eq!(item.ids.tmdb, Some(25237));
+        assert_eq!(item.title.as_deref(), Some("Come and See"));
+        // `release_date` is what the list endpoint sends; `released` is the
+        // media-info spelling.
+        assert_eq!(item.released, chrono::NaiveDate::from_ymd_opt(1985, 10, 17));
+        assert_eq!(item.attrs.country.as_deref(), Some("su"));
+        assert_eq!(item.attrs.original_language.as_deref(), Some("ru"));
+        assert_eq!(item.attrs.spoken_language.as_deref(), Some("ru"));
+        assert_eq!(
+            item.attrs.genres,
+            vec!["drama".to_string(), "war".to_string()]
+        );
+        assert_eq!(item.attrs.runtime, Some(142));
+        assert_eq!(item.attrs.status.as_deref(), Some("released"));
+        // The list endpoint does not send a certification; the batch one does.
+        assert_eq!(item.attrs.content_rating, None);
+    }
+
+    #[test]
+    fn the_media_info_payload_parses_with_the_same_reader() {
+        let raw = json!({
+            "title": "Fight Club",
+            "released": "1999-10-15",
+            "country": "US",
+            "language": "en",
+            "certification": "R",
+            "genres": [{"id": 6, "title": "Drama"}, {"id": 21, "title": "Thriller"}],
+            "runtime": 139,
+            "status": "released"
+        });
+
+        let attrs = attrs_from_json(&raw);
+        assert_eq!(attrs.country.as_deref(), Some("us"));
+        assert_eq!(attrs.content_rating.as_deref(), Some("R"));
+        assert_eq!(
+            attrs.genres,
+            vec!["drama".to_string(), "thriller".to_string()]
+        );
+        assert_eq!(attrs.runtime, Some(139));
+    }
+
+    #[test]
+    fn an_item_with_nothing_descriptive_carries_no_attributes() {
+        let raw = json!({"id": 550, "mediatype": "movie", "title": "Fight Club"});
+        let item = convert(None, &raw, 0).expect("converts");
+        assert!(item.attrs.is_empty());
     }
 
     #[test]

@@ -3,11 +3,20 @@
 # Everything below is optional except `sources` and `lists`. Values may contain
 # ${ENV_VAR} or ${ENV_VAR:-fallback}, so secrets can stay in the environment.
 #
-# Operators:   |  +  union        -  difference
-#              &  intersection    ^  in exactly one side
-# Precedence follows Python's set operators - `-` and `+` bind tightest, then
-# `&`, then `^`, then `|`. Bracket anything non-obvious.
-# A name containing `-` must be quoted, because `-` is an operator: "top-250".
+# Two small languages, kept apart on purpose:
+#
+#   list_formula:  set algebra over sources and lists
+#                    |  +  union        -  difference
+#                    &  intersection    ^  in exactly one side
+#                  Precedence follows Python's set operators - `-` and `+` bind
+#                  tightest, then `&`, then `^`, then `|`. Bracket anything
+#                  non-obvious. A name containing `-` must be quoted, because
+#                  `-` is an operator: "top-250".
+#
+#   filter:        boolean algebra over names from the `filters:` block
+#                    and  or  not, with `not` tightest and `and` before `or`.
+#                  The names come from the top-level `filters:` block - it is
+#                  an expression, not a single filter name.
 
 server:
   host: 0.0.0.0
@@ -24,6 +33,18 @@ cache:
 providers:
   mdblist:
     apikey: ${MDBLIST_API_KEY:-}
+
+# Backfilling attributes that a source does not carry, so that filters work on
+# items from Radarr, Sonarr, static blocks and bare JSON feeds too. Only the
+# attributes some filter actually reads are ever fetched, in batches of 200, and
+# the answers are kept for a month - so a config with no `filters:` makes no
+# requests here at all. Needs `providers.mdblist.apikey`.
+metadata:
+  enabled: true
+  ttl: 30d          # country, language and genre do not change
+  miss_ttl: 7d      # how long to remember "the provider has never heard of it"
+  budget: 2000      # most requests one enrichment pass may make
+  reserve: 1000     # stop when the daily allowance drops below this
 
 sources:
   # An MDBList list, addressed by `username/listname`, by `list_id`, or by a
@@ -47,6 +68,9 @@ sources:
   #   api_key: ${SONARR_API_KEY}
 
   # Any JSON feed. `fields` is optional - common spellings are tried by default.
+  # It also maps the descriptive fields, when the feed has them:
+  # `country`, `original_language`, `spoken_language`, `genres`, `runtime`,
+  # `content_rating`, `status`, `released`.
   # stevenlu:
   #   type: json
   #   url: https://popular-movies-data.stevenlu.com/movies.json
@@ -61,9 +85,36 @@ sources:
     items:
       - tmdb:550
 
+# Named conditions, applied to lists through `filter:`. Within one block every
+# line must hold; within one line, comma-separated values are alternatives.
+#
+#   country, original_language, spoken_language, content_rating, status, type
+#                          bare = any of, `.not`
+#   genre                  bare = any of, `.not`, `.all`
+#   runtime, year          bare = equals, `.gt` `.gte` `.lt` `.lte`
+#   release                `.before`, `.after`   (bare means `.after`)
+#   title                  bare = contains, `.not`, `.begins`, `.ends`, `.regex`
+#
+# `unknown:` decides what a line answers when the item does not know the
+# attribute; it defaults to `exclude`, matching the way `min_year` already drops
+# items that have no year.
+# filters:
+  # Note `su`: MDBList reports one country per title, and Soviet-era films are
+  # filed under it rather than under `ru`. Filtering on `original_language` is
+  # often the steadier choice.
+  # russian:
+  #   country: ru, su
+  #   unknown: exclude       # exclude | include
+  # kids_safe:
+  #   content_rating: G, PG
+  #   runtime.lte: 100
+  # animation:
+  #   genre: animation
+
 lists:
   # wanted_movies:
-  #   expr: "(trending_movies | top250) - my_radarr - never"
+  #   list_formula: "(trending_movies | top250) - my_radarr - never"
+  #   filter: "russian and (kids_safe or animation)"
   #   media_type: movie      # any | movie | show
   #   min_year: 1990
   #   sort: rank             # none | rank | title | year | released | random
@@ -74,5 +125,5 @@ lists:
   #     sync_mode: sync
   #     collection_order: custom
   example:
-    expr: "never"
+    list_formula: "never"
     media_type: movie

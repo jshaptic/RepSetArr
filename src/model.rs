@@ -149,6 +149,79 @@ pub fn normalize_imdb(raw: &str) -> Option<String> {
     Some(format!("tt{digits:0>7}"))
 }
 
+/// Descriptive metadata used by filters. Every field is optional: sources
+/// populate what their payload happens to carry, and the enricher fills gaps
+/// later. Absent means "not known", never "not applicable".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attrs {
+    /// ISO-3166-1 alpha-2, lowercased. Upstreams report a single country even
+    /// for co-productions, so this is "a" country, not "the" country.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// ISO-639-1, lowercased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_language: Option<String>,
+    /// Lowercased genre names, deduplicated, in the order the source gave them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    /// Minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<u32>,
+    /// Certification as the upstream spells it, uppercased (`PG`, `R`, `TV-MA`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_rating: Option<String>,
+    /// Release status, lowercased (`released`, `in production`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl Attrs {
+    pub fn is_empty(&self) -> bool {
+        self.country.is_none()
+            && self.original_language.is_none()
+            && self.spoken_language.is_none()
+            && self.genres.is_empty()
+            && self.runtime.is_none()
+            && self.content_rating.is_none()
+            && self.status.is_none()
+    }
+
+    /// Fill in whatever this set of attributes is missing from `other`.
+    /// Existing values win, matching [`MediaIds::fill_from`].
+    pub fn fill_from(&mut self, other: &Attrs) {
+        if self.country.is_none() {
+            self.country = other.country.clone();
+        }
+        if self.original_language.is_none() {
+            self.original_language = other.original_language.clone();
+        }
+        if self.spoken_language.is_none() {
+            self.spoken_language = other.spoken_language.clone();
+        }
+        if self.genres.is_empty() {
+            self.genres = other.genres.clone();
+        }
+        if self.runtime.is_none() {
+            self.runtime = other.runtime;
+        }
+        if self.content_rating.is_none() {
+            self.content_rating = other.content_rating.clone();
+        }
+        if self.status.is_none() {
+            self.status = other.status.clone();
+        }
+    }
+}
+
+/// Lowercase and trim a free-form code (country, language, genre); empty becomes
+/// `None` so a source sending `""` does not look like knowledge we do not have.
+pub fn normalize_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// One movie or show, normalized away from whatever the source called things.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
@@ -164,6 +237,8 @@ pub struct Item {
     /// Position within the source list, if the source has a meaningful order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Attrs::is_empty")]
+    pub attrs: Attrs,
 }
 
 impl Item {
@@ -204,6 +279,7 @@ impl Item {
         if self.rank.is_none() {
             self.rank = other.rank;
         }
+        self.attrs.fill_from(&other.attrs);
     }
 
     /// Best-effort release year: the explicit year, else the year of the release date.

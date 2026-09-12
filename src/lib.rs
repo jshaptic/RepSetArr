@@ -4,9 +4,12 @@
 pub mod api;
 pub mod cache;
 pub mod config;
+pub mod enrich;
 pub mod expr;
+pub mod filter;
 pub mod identity;
 pub mod lists;
+pub mod meta;
 pub mod model;
 pub mod refresh;
 pub mod sources;
