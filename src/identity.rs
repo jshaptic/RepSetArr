@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::model::{Item, ItemKey};
 
-/// Identifies one real-world title within a single evaluation.
+/// Identifies one real-world title across every configured source.
 pub type GroupId = usize;
 
 /// A slot handed out by [`Interner::insert`]. Slots are merged as more items

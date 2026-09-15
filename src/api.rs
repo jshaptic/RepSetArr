@@ -87,11 +87,15 @@ async fn health(State(state): State<SharedState>) -> Json<Value> {
         "config": state.config_path.display().to_string(),
         "sources": Value::Object(sources),
         "lists": runtime.config.lists.keys().collect::<Vec<_>>(),
+        "list_order": runtime.list_order,
     }))
 }
 
 async fn index(State(state): State<SharedState>) -> Json<Value> {
     let runtime = state.runtime();
+    // One pass for the whole config: evaluating each list on its own would
+    // re-run every dependency chain once per list.
+    let mut evaluations = lists::evaluate_all(&runtime, &state.cache, &state.meta);
     let lists: Vec<Value> = runtime
         .config
         .lists
@@ -104,13 +108,17 @@ async fn index(State(state): State<SharedState>) -> Json<Value> {
                 "filter": config.filter,
                 "media_type": media_type_label(config.media_type),
                 "sources": compiled.map(|list| list.source_deps.clone()).unwrap_or_default(),
+                "list_deps": compiled.map(|list| list.list_deps.clone()).unwrap_or_default(),
                 "endpoints": {
                     "radarr": format!("/api/lists/{name}/radarr"),
                     "sonarr": format!("/api/lists/{name}/sonarr"),
                     "kometa": format!("/api/lists/{name}/kometa.yml"),
                 },
             });
-            match lists::evaluate(&runtime, &state.cache, &state.meta, name) {
+            let evaluation = evaluations
+                .remove(name)
+                .unwrap_or_else(|| Err(EvalError::UnknownList(name.clone())));
+            match evaluation {
                 Ok(evaluation) => {
                     let movies = count(&evaluation.items, MediaType::Movie);
                     entry["items"] = json!(evaluation.items.len());

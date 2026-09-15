@@ -92,6 +92,12 @@ IMDb, Sonarr gives you TVDb and IMDb, a homemade feed might give you IMDb alone.
 one provider would quietly leave duplicates in a union and leave items behind in a
 difference. Nothing is ever matched by title or year.
 
+Identity is resolved across **every** configured source at once, not per list. A source that
+bridges two id namespaces therefore merges entries in a list that does not reference it - which
+is what you want, since whether two ids name the same film is a fact about the world rather
+than about the list you happen to be looking at. It only ever merges genuine duplicates, so a
+count can fall when you add a source, never rise.
+
 Items that arrive with no ids at all are dropped - there is nothing to match them on.
 
 ## Configuration

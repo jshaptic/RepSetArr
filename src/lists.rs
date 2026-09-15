@@ -1,6 +1,6 @@
 //! Turning a configured list into items: fetch, identify, evaluate, post-process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexSet;
@@ -36,52 +36,57 @@ pub enum EvalError {
     Other(#[from] anyhow::Error),
 }
 
-pub fn evaluate(
+/// Every configured list, evaluated in one pass.
+///
+/// One [`Interner`] covers every source, so identity is resolved once for the
+/// whole config rather than once per list. That is what lets a single walk of
+/// `list_order` serve every list: sets built under different interners have
+/// incomparable group ids and cannot be shared.
+///
+/// Failure is per list, not per pass. A list whose sources have not been
+/// fetched yet gets its own [`EvalError::NoData`] while every other list is
+/// still answered, and because `source_deps` is transitive, a list that depends
+/// on an unanswerable one fails for the same reason without needing a second
+/// traversal.
+pub fn evaluate_all(
     runtime: &Runtime,
     cache: &CacheStore,
     meta: &MetaStore,
-    name: &str,
-) -> Result<Evaluation, EvalError> {
-    let compiled = runtime
-        .list(name)
-        .ok_or_else(|| EvalError::UnknownList(name.to_string()))?;
+) -> HashMap<String, Result<Evaluation, EvalError>> {
+    // One interner for every source: items from different sources are only
+    // comparable once they have been through the same identity pass.
+    let mut interner = Interner::new();
+    let mut slots: Vec<(String, Vec<usize>)> = Vec::with_capacity(runtime.config.sources.len());
+    let mut missing: HashSet<&str> = HashSet::new();
+    let mut stale: HashSet<&str> = HashSet::new();
 
-    // Gather every source the list needs, transitively.
-    let mut missing = Vec::new();
-    let mut stale_sources = Vec::new();
-    let mut fetched = Vec::new();
-    for source_name in &compiled.source_deps {
+    for source_name in runtime.config.sources.keys() {
         let status = cache.status(source_name);
         match status.items.clone() {
-            None => missing.push(source_name.clone()),
+            None => {
+                missing.insert(source_name);
+            }
             Some(items) => {
                 if status.is_stale(runtime.ttl_for(source_name)) {
-                    stale_sources.push(source_name.clone());
+                    stale.insert(source_name);
                 }
-                fetched.push((source_name.clone(), items));
+                let source_slots = items
+                    .iter()
+                    .filter_map(|item| interner.insert(item))
+                    .collect();
+                slots.push((source_name.clone(), source_slots));
             }
         }
-    }
-    if !missing.is_empty() {
-        return Err(EvalError::NoData(missing));
-    }
-
-    // One interner for the whole evaluation: items from different sources are
-    // only comparable once they have been through the same identity pass.
-    let mut interner = Interner::new();
-    let mut slots: Vec<(String, Vec<usize>)> = Vec::with_capacity(fetched.len());
-    for (source_name, items) in &fetched {
-        let source_slots = items
-            .iter()
-            .filter_map(|item| interner.insert(item))
-            .collect();
-        slots.push((source_name.clone(), source_slots));
     }
 
     // Overlay what the enricher has learned. This reads the store only; a
     // request never fetches, so a cold store means a provisional answer rather
     // than a slow one.
-    if !compiled.required_attrs.is_empty() {
+    if runtime
+        .lists
+        .values()
+        .any(|list| !list.required_attrs.is_empty())
+    {
         for item in interner.items_mut() {
             if let Some(attrs) = meta.lookup(item) {
                 item.attrs.fill_from(&attrs);
@@ -98,44 +103,79 @@ pub fn evaluate(
         sets.insert(source_name, set);
     }
 
-    let mut unenriched = 0usize;
-    // Dependencies first, so a list that references another list sees the
-    // other list's post-processed result.
-    for list_name in compiled
-        .list_deps
-        .iter()
-        .chain(std::iter::once(&compiled.name))
-    {
-        let list = runtime
-            .list(list_name)
-            .ok_or_else(|| EvalError::UnknownList(list_name.clone()))?;
-        let config = runtime
-            .config
-            .lists
-            .get(list_name)
-            .ok_or_else(|| EvalError::UnknownList(list_name.clone()))?;
-        let evaluated =
-            expr::eval(&list.expr, &sets).map_err(|error| EvalError::Other(error.into()))?;
-        let (processed, blind) = post_process(evaluated, list, config, &interner);
-        if list_name == name {
-            unenriched = blind;
+    let evaluated_at = Utc::now();
+    let mut results: HashMap<String, Result<Evaluation, EvalError>> = HashMap::new();
+
+    // Dependency order, so a list that references another list sees the other
+    // list's post-processed result.
+    for list_name in &runtime.list_order {
+        let (Some(list), Some(config)) =
+            (runtime.list(list_name), runtime.config.lists.get(list_name))
+        else {
+            continue;
+        };
+
+        // `source_deps` is transitive, so this also catches a list whose only
+        // problem is a dependency list that cannot be answered.
+        let blocked: Vec<String> = list
+            .source_deps
+            .iter()
+            .filter(|source| missing.contains(source.as_str()))
+            .cloned()
+            .collect();
+        if !blocked.is_empty() {
+            results.insert(list_name.clone(), Err(EvalError::NoData(blocked)));
+            continue;
         }
+
+        let evaluated = match expr::eval(&list.expr, &sets) {
+            Ok(set) => set,
+            Err(error) => {
+                results.insert(list_name.clone(), Err(EvalError::Other(error.into())));
+                continue;
+            }
+        };
+        let (processed, unenriched) = post_process(evaluated, list, config, &interner);
+
+        let items: Vec<Item> = processed
+            .iter()
+            .map(|group| interner.item(*group).clone())
+            .collect();
+        let stale_sources: Vec<String> = list
+            .source_deps
+            .iter()
+            .filter(|source| stale.contains(source.as_str()))
+            .cloned()
+            .collect();
+
+        results.insert(
+            list_name.clone(),
+            Ok(Evaluation {
+                name: list_name.clone(),
+                items,
+                stale_sources,
+                unenriched,
+                evaluated_at,
+            }),
+        );
         sets.insert(list_name.clone(), processed);
     }
 
-    let result = sets.remove(name).expect("the list was just evaluated");
-    let items: Vec<Item> = result
-        .into_iter()
-        .map(|group| interner.item(group).clone())
-        .collect();
+    results
+}
 
-    Ok(Evaluation {
-        name: name.to_string(),
-        items,
-        stale_sources,
-        unenriched,
-        evaluated_at: Utc::now(),
-    })
+pub fn evaluate(
+    runtime: &Runtime,
+    cache: &CacheStore,
+    meta: &MetaStore,
+    name: &str,
+) -> Result<Evaluation, EvalError> {
+    if runtime.list(name).is_none() {
+        return Err(EvalError::UnknownList(name.to_string()));
+    }
+    evaluate_all(runtime, cache, meta)
+        .remove(name)
+        .unwrap_or_else(|| Err(EvalError::UnknownList(name.to_string())))
 }
 
 /// Filter, sort and limit - applied after the algebra, so a list used inside
