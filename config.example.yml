@@ -8,10 +8,14 @@
 #   list_formula:  set algebra over sources and lists
 #                    |  +  union        -  difference
 #                    &  intersection    ^  in exactly one side
+#                    *  wildcard - the union of every matching name
 #                  Precedence follows Python's set operators - `-` and `+` bind
 #                  tightest, then `&`, then `^`, then `|`. Bracket anything
 #                  non-obvious. A name containing `-` must be quoted, because
 #                  `-` is an operator: "top-250".
+#                  `*` stands for any run of characters, dots included, so
+#                  `animation.studios.*` is every source or list whose name
+#                  starts that way. It is reserved: no name may contain one.
 #
 #   filter:        boolean algebra over names from the `filters:` block
 #                    and  or  not, with `not` tightest and `and` before `or`.

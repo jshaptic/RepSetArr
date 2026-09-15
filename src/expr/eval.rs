@@ -24,6 +24,9 @@ pub fn eval(expr: &Expr, sets: &HashMap<String, Set>) -> Result<Set, UnknownName
             .get(name)
             .cloned()
             .ok_or_else(|| UnknownName(name.clone())),
+        // Patterns are expanded when the config is compiled; one reaching here
+        // means an expression skipped that step.
+        Expr::Wildcard(pattern) => Err(UnknownName(pattern.clone())),
         Expr::Op { op, lhs, rhs } => {
             let lhs = eval(lhs, sets)?;
             let rhs = eval(rhs, sets)?;

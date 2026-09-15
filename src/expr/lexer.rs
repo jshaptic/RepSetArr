@@ -38,8 +38,11 @@ pub struct Spanned {
 
 /// `-` is an operator, so it cannot also be a name character; a name that needs
 /// one has to be quoted. Everything else an *Arr-style list name uses is fine.
+///
+/// `*` is here so that a wildcard pattern lexes as a single name; it is
+/// reserved, and a configured name may not contain one.
 fn is_name_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '/')
+    c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '/' | '*')
 }
 
 pub fn lex(input: &str) -> Result<Vec<Spanned>, ParseError> {

@@ -25,8 +25,12 @@ impl SetOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
-    /// A source or another list, by name.
+    /// A source or another list, by name. Never contains a `*`.
     Name(String),
+    /// A pattern such as `animation.studios.*`, standing for the union of every
+    /// name it matches. Expanded when the config is compiled, so a compiled
+    /// expression never holds one.
+    Wildcard(String),
     Op {
         op: SetOp,
         lhs: Box<Expr>,
@@ -35,6 +39,17 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// The single place that decides whether a name written in a formula is a
+    /// literal or a pattern, so the parser and the expander cannot disagree.
+    pub fn leaf(text: impl Into<String>) -> Expr {
+        let text = text.into();
+        if super::wildcard::is_pattern(&text) {
+            Expr::Wildcard(text)
+        } else {
+            Expr::Name(text)
+        }
+    }
+
     pub fn binary(op: SetOp, lhs: Expr, rhs: Expr) -> Expr {
         Expr::Op {
             op,
@@ -57,6 +72,10 @@ impl Expr {
                     out.push(name);
                 }
             }
+            // A pattern is expanded before anyone asks for names, so it
+            // contributes none - reporting it here would surface a second,
+            // misleading "not a source or a list" problem for the same text.
+            Expr::Wildcard(_) => {}
             Expr::Op { lhs, rhs, .. } => {
                 lhs.collect_names(out);
                 rhs.collect_names(out);
@@ -67,7 +86,7 @@ impl Expr {
     /// Fully bracketed rendering, used in error messages and tests.
     pub fn to_canonical_string(&self) -> String {
         match self {
-            Expr::Name(name) => name.clone(),
+            Expr::Name(name) | Expr::Wildcard(name) => name.clone(),
             Expr::Op { op, lhs, rhs } => format!(
                 "({} {} {})",
                 lhs.to_canonical_string(),

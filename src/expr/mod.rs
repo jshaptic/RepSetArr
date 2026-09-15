@@ -4,10 +4,12 @@ pub mod ast;
 pub mod eval;
 pub mod lexer;
 pub mod parser;
+pub mod wildcard;
 
 pub use ast::{Expr, SetOp};
 pub use eval::{Set, UnknownName, apply, eval};
 pub use parser::parse;
+pub use wildcard::is_pattern;
 
 /// A syntax error, carrying the character offset it was found at.
 #[derive(Debug, Clone, PartialEq, Eq)]

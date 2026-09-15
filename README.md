@@ -60,6 +60,7 @@ volume if yours differ.
 | `-` | difference - the left side, minus the right | `top250 - my_radarr` |
 | `&` | intersection - only what is in both | `top250 & oscar_winners` |
 | `^` | symmetric difference - in exactly one side | `list_a ^ list_b` |
+| `*` | wildcard - the union of every matching name | `animation.studios.*` |
 | `( )` | brackets, nested as deep as you like | `(a \| b) - (c & d)` |
 
 Precedence follows Python's set operators: `+` and `-` bind tightest, then `&`, then `^`,
@@ -79,6 +80,44 @@ lists:
 
 Names are bare words. Because `-` is an operator, **a name containing a dash must be
 quoted**: `"top-250" - my_radarr`. Underscores need no quoting and are easier to live with.
+`*` is reserved for wildcards and may not appear in a name at all.
+
+### Wildcards
+
+`*` stands for any run of characters, so a pattern is shorthand for the union of every
+configured name it matches:
+
+```yaml
+sources:
+  animation.studios.ghibli: { type: mdblist, list: someone/ghibli }
+  animation.studios.disney: { type: mdblist, list: someone/disney }
+  animation.studios.pixar:  { type: mdblist, list: someone/pixar }
+lists:
+  animation.all:
+    list_formula: "animation.studios.*"     # all three, and whatever you add next
+```
+
+The details worth knowing:
+
+- A pattern is an operand like any other, so it composes: `animation.studios.* - my_radarr`.
+- `*` may appear anywhere and more than once - `*.ghibli`, `anime.*.top`, or `*` on its own
+  for everything. It **crosses dots**, so `animation.*` also matches
+  `animation.studios.ghibli`.
+- It matches **sources and other lists alike**, the same way a name does.
+- The expansion is a union in config declaration order, sources first, then lists - and
+  since a union keeps the left side's order, that is the order items come out in.
+- A list is never included in its own pattern. Two lists whose patterns match each other
+  still form a cycle, and the loader says so - using the names it expanded to, which you
+  never typed.
+- A pattern that matches nothing is a config error, not an empty list: a typo should not
+  quietly serve you zero items.
+- Quoting does not turn `*` back into a literal, because a name may not contain one.
+  `"my-list.*"` is a pattern over dashed names - which is the reason to quote it.
+- A wildcard widens the dependency graph, and a list fails while **any** source it reaches
+  has no data yet. `animation.studios.*` over a dozen sources means one dead upstream
+  fails the whole list, where naming three sources would not have.
+
+Wildcards belong to `list_formula:` only - `filter:` is a different language and has no `*`.
 
 ### What counts as the same item
 
@@ -354,7 +393,7 @@ REPSETARR_CONFIG=./config.example.yml cargo run
 
 | Path | What lives there |
 |---|---|
-| `src/expr/` | The expression language - lexer, precedence-climbing parser, evaluator |
+| `src/expr/` | The expression language - lexer, parser, wildcard expansion, evaluator |
 | `src/identity.rs` | Union-find over external ids: what makes two items one item |
 | `src/sources/` | One module per provider, behind a single fetch entry point |
 | `src/cache.rs` | Snapshots, staleness, atomic writes to disk |

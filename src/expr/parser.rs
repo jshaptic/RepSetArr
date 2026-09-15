@@ -73,7 +73,7 @@ impl Parser {
         };
 
         match spanned.token {
-            Token::Name(name) => Ok(Expr::Name(name)),
+            Token::Name(name) => Ok(Expr::leaf(name)),
             Token::LParen => {
                 let inner = self.parse_expr(0)?;
                 match self.next() {
@@ -166,6 +166,33 @@ mod tests {
     #[test]
     fn dotted_colonned_and_slashed_names_are_bare() {
         assert_eq!(canonical("mdb:user/list_1.v2"), "mdb:user/list_1.v2");
+    }
+
+    #[test]
+    fn a_name_containing_a_star_is_a_wildcard() {
+        assert!(matches!(
+            parse("animation.studios.*").unwrap(),
+            Expr::Wildcard(_)
+        ));
+        assert_eq!(canonical("a | b.*"), "(a | b.*)");
+        assert_eq!(canonical("*"), "*");
+    }
+
+    #[test]
+    fn a_quoted_pattern_is_still_a_wildcard() {
+        // `*` is reserved, so quoting buys a dash - not a literal asterisk.
+        assert!(matches!(parse("\"my-list.*\"").unwrap(), Expr::Wildcard(_)));
+    }
+
+    #[test]
+    fn a_wildcard_is_an_atom_like_any_other_name() {
+        assert_eq!(canonical("a - b.* & c"), "((a - b.*) & c)");
+        assert_eq!(canonical("(a | b.*) - c"), "((a | b.*) - c)");
+    }
+
+    #[test]
+    fn wildcards_contribute_no_names() {
+        assert_eq!(parse("a | b.*").unwrap().names(), vec!["a"]);
     }
 
     #[test]

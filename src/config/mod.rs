@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use indexmap::{IndexMap, IndexSet};
 
-use crate::expr::{self, Expr};
+use crate::expr::{self, Expr, wildcard};
 use crate::filter::{self, Attribute, Condition, FilterDef, Program};
 use crate::model::parse_id_spec;
 pub use model::*;
@@ -219,6 +219,7 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
                 quoted_list(&unknown)
             ));
         }
+        reject_wildcard_in_name("source", name, &mut problems);
         validate_source(name, source, &config, &mut problems);
     }
 
@@ -228,6 +229,7 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
                 "`{name}` is used for both a source and a list; names must be unique"
             ));
         }
+        reject_wildcard_in_name("list", name, &mut problems);
         validate_list_options(name, list, &mut problems);
     }
 
@@ -280,11 +282,28 @@ pub fn compile(config: Config, path: PathBuf) -> Result<Runtime> {
 
     // Parse every expression before resolving names so a syntax error does not
     // hide behind a name error.
+    //
+    // Wildcards are expanded here too: every later pass - name resolution, the
+    // topological sort, dependency collection, evaluation - then works on a
+    // tree of plain names and needs to know nothing about patterns.
+    let candidates: Vec<&str> = config
+        .sources
+        .keys()
+        .chain(config.lists.keys())
+        .map(String::as_str)
+        .collect();
     let mut parsed: IndexMap<String, Expr> = IndexMap::new();
     for (name, list) in &config.lists {
         match expr::parse(&list.list_formula) {
             Ok(expression) => {
-                parsed.insert(name.clone(), expression);
+                let (expanded, unmatched) = wildcard::expand_expr(&expression, &candidates, name);
+                for pattern in unmatched {
+                    problems.push(format!(
+                        "list `{name}`: `{pattern}` matches no source or list{}",
+                        wildcard_hint(&pattern, name, &config)
+                    ));
+                }
+                parsed.insert(name.clone(), expanded);
             }
             Err(error) => {
                 problems.push(format!("list `{name}`: {error} in `{}`", list.list_formula))
@@ -472,6 +491,36 @@ fn dash_hint(referenced: &str, config: &Config) -> String {
         Some(name) => format!(" (`-` is the difference operator; quote it as `\"{name}\"`)"),
         None => String::new(),
     }
+}
+
+/// `*` is the wildcard, so a configured name may not contain one - otherwise
+/// there would be no way to tell a pattern from the name it collides with.
+fn reject_wildcard_in_name(kind: &str, name: &str, problems: &mut Vec<String>) {
+    if wildcard::is_pattern(name) {
+        problems.push(format!(
+            "{kind} `{name}`: `*` is reserved for wildcard patterns and cannot be part of a name"
+        ));
+    }
+}
+
+/// Why a pattern found nothing, for the two cases that are not simple typos.
+fn wildcard_hint(pattern: &str, defining: &str, config: &Config) -> String {
+    if wildcard::matches(pattern, defining) {
+        return format!(" (it matches only `{defining}`, and a list may not include itself)");
+    }
+    // `my-list.*` written bare is lexed as `my - list.*`, so the pattern that
+    // arrives here is the tail - and it matches once the lost prefix is allowed for.
+    let dashed = format!("*{pattern}");
+    if config
+        .sources
+        .keys()
+        .chain(config.lists.keys())
+        .any(|name| name.contains('-') && wildcard::matches(&dashed, name))
+    {
+        return " (`-` is the difference operator; a pattern containing one must be quoted)"
+            .to_string();
+    }
+    String::new()
 }
 
 /// The common mistake is reaching for the set language inside `filter:`.
@@ -701,6 +750,140 @@ lists:
 "#,
         );
         assert!(error.contains("quote it as"), "{error}");
+    }
+
+    const WILDCARDS: &str = r#"
+sources:
+  animation.studios.ghibli: { type: static, items: ["tmdb:1"] }
+  animation.studios.disney: { type: static, items: ["tmdb:2"] }
+  animation.studios.pixar:  { type: static, items: ["tmdb:3"] }
+  live_action.nolan:        { type: static, items: ["tmdb:4"] }
+lists:
+  animation.all:
+    list_formula: "animation.studios.*"
+  mixed:
+    list_formula: "animation.all | *.nolan"
+"#;
+
+    #[test]
+    fn a_wildcard_expands_to_every_matching_source_in_declaration_order() {
+        let runtime = compile_str(WILDCARDS).expect("compiles");
+        let all = runtime.list("animation.all").unwrap();
+        assert_eq!(
+            all.expr.to_canonical_string(),
+            "((animation.studios.ghibli | animation.studios.disney) \
+             | animation.studios.pixar)"
+        );
+        assert_eq!(
+            all.source_deps,
+            vec![
+                "animation.studios.ghibli",
+                "animation.studios.disney",
+                "animation.studios.pixar"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_matches_lists_as_well_as_sources() {
+        let runtime = compile_str(WILDCARDS).expect("compiles");
+        let mixed = runtime.list("mixed").unwrap();
+        assert_eq!(mixed.list_deps, vec!["animation.all"]);
+        assert!(
+            mixed.source_deps.contains(&"live_action.nolan".to_string()),
+            "{:?}",
+            mixed.source_deps
+        );
+    }
+
+    #[test]
+    fn a_wildcard_never_matches_the_list_that_defines_it() {
+        // `animation.all` matches its own pattern; including it would be a cycle.
+        let runtime = compile_str(
+            r#"
+sources:
+  animation.ghibli: { type: static, items: ["tmdb:1"] }
+lists:
+  animation.all:
+    list_formula: "animation.*"
+"#,
+        )
+        .expect("compiles");
+        assert_eq!(
+            runtime
+                .list("animation.all")
+                .unwrap()
+                .expr
+                .to_canonical_string(),
+            "animation.ghibli"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_matching_nothing_is_reported() {
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+lists:
+  bad: { list_formula: "ghost.*" }
+"#,
+        );
+        assert!(error.contains("matches no source or list"), "{error}");
+        assert!(error.contains("`ghost.*`"), "{error}");
+    }
+
+    #[test]
+    fn a_pattern_that_matches_only_its_own_list_says_so() {
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+lists:
+  only.me: { list_formula: "only.*" }
+"#,
+        );
+        assert!(error.contains("may not include itself"), "{error}");
+    }
+
+    #[test]
+    fn an_unquoted_dashed_pattern_gets_a_quoting_hint() {
+        let error = compile_err(
+            r#"
+sources:
+  top-250.movies: { type: static, items: ["tmdb:1"] }
+lists:
+  bad: { list_formula: "top-250.*" }
+"#,
+        );
+        assert!(error.contains("must be quoted"), "{error}");
+    }
+
+    #[test]
+    fn a_star_in_a_configured_name_is_rejected() {
+        let error = compile_err(
+            r#"
+sources:
+  "star*source": { type: static, items: ["tmdb:1"] }
+lists:
+  bad: { list_formula: "\"star*source\"" }
+"#,
+        );
+        assert!(error.contains("reserved for wildcard"), "{error}");
+    }
+
+    #[test]
+    fn wildcards_over_lists_can_still_form_a_cycle() {
+        let error = compile_err(
+            r#"
+sources:
+  a: { type: static, items: ["tmdb:1"] }
+lists:
+  group.one: { list_formula: "a | group.*" }
+  group.two: { list_formula: "a | group.*" }
+"#,
+        );
+        assert!(error.contains("cycle"), "{error}");
     }
 
     #[test]
