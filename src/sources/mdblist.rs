@@ -149,7 +149,6 @@ pub async fn fetch(
     if source.media_type != MediaTypeFilter::Any {
         items.retain(|item| source.media_type.matches(item.media_type));
     }
-    log_countries(&items);
     Ok(items)
 }
 
@@ -217,43 +216,7 @@ fn convert(hint: Option<MediaType>, raw: &Value, position: usize) -> Option<Item
     item.released = as_date(first_present(raw, &["release_date", "released"]));
     item.rank = as_u32(raw.get("rank")).or(Some(position as u32 + 1));
     item.attrs = attrs_from_json(raw);
-    log_item_country(raw, &item);
     Some(item)
-}
-
-/// Temporary: dump what MDBList sent vs what we keep, so `ru`/`su` can be
-/// checked against a real list. `SU` is the Soviet-era code; it is not `ru`.
-fn log_item_country(raw: &Value, item: &Item) {
-    let raw_country = as_str(raw.get("country")).unwrap_or("");
-    tracing::info!(
-        title = item.title.as_deref().unwrap_or("?"),
-        year = item.year,
-        raw_country,
-        country = item.attrs.country.as_deref().unwrap_or("(none)"),
-        "mdblist item country"
-    );
-}
-
-fn log_countries(items: &[Item]) {
-    let ru = items
-        .iter()
-        .filter(|item| item.attrs.country.as_deref() == Some("ru"))
-        .count();
-    let su = items
-        .iter()
-        .filter(|item| item.attrs.country.as_deref() == Some("su"))
-        .count();
-    let unknown = items
-        .iter()
-        .filter(|item| item.attrs.country.is_none())
-        .count();
-    tracing::info!(
-        total = items.len(),
-        ru,
-        su,
-        unknown,
-        "mdblist country ru/su counts"
-    );
 }
 
 /// The descriptive fields MDBList ships alongside the ids, in both the list-items
