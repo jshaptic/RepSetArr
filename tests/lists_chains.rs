@@ -67,16 +67,16 @@ async fn a_three_deep_chain_composes() {
     let state = state_from(CHAIN).await;
 
     assert_eq!(
-        ids(&get(&state, "/api/lists/a/radarr").await.json()),
+        ids(&get(&state, "/api/lists/a?format=radarr").await.json()),
         [1, 2, 3]
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/b/radarr").await.json()),
+        ids(&get(&state, "/api/lists/b?format=radarr").await.json()),
         [1, 3],
         "`b` subtracts src3 from what `a` produced"
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/c/radarr").await.json()),
+        ids(&get(&state, "/api/lists/c?format=radarr").await.json()),
         [3],
         "`c` intersects src4 with what `b` produced; 9 is not in `b` and 1 is not in src4"
     );
@@ -135,15 +135,15 @@ lists:
     let state = state_from(DIAMOND).await;
 
     assert_eq!(
-        ids(&get(&state, "/api/lists/left/radarr").await.json()),
+        ids(&get(&state, "/api/lists/left?format=radarr").await.json()),
         [2, 3, 4]
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/right/radarr").await.json()),
+        ids(&get(&state, "/api/lists/right?format=radarr").await.json()),
         [1, 3, 4]
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/top/radarr").await.json()),
+        ids(&get(&state, "/api/lists/top?format=radarr").await.json()),
         [2, 3, 4, 1],
         "a union keeps the left side's order and appends what is new on the right"
     );
@@ -180,11 +180,13 @@ lists:
     let state = state_from(LIMITED).await;
 
     assert_eq!(
-        ids(&get(&state, "/api/lists/shortlist/radarr").await.json()),
+        ids(&get(&state, "/api/lists/shortlist?format=radarr")
+            .await
+            .json()),
         [10, 11]
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/to_grab/radarr").await.json()),
+        ids(&get(&state, "/api/lists/to_grab?format=radarr").await.json()),
         [10, 11],
         "13 was cut by `shortlist`'s limit, so subtracting `owned` cannot bring it back"
     );
@@ -231,11 +233,13 @@ lists:
     let state = state_from(&config).await;
 
     assert_eq!(
-        ids(&get(&state, "/api/lists/russian_only/radarr").await.json()),
+        ids(&get(&state, "/api/lists/russian_only?format=radarr")
+            .await
+            .json()),
         [20, 22]
     );
     assert_eq!(
-        ids(&get(&state, "/api/lists/to_grab/radarr").await.json()),
+        ids(&get(&state, "/api/lists/to_grab?format=radarr").await.json()),
         [20],
         "21 was dropped by `russian_only`'s filter, not by the subtraction"
     );
@@ -292,11 +296,13 @@ lists:
     );
 
     assert_eq!(
-        get(&state, "/api/lists/fine/radarr").await.status,
+        get(&state, "/api/lists/fine?format=radarr").await.status,
         StatusCode::OK
     );
     assert_eq!(
-        get(&state, "/api/lists/downstream/radarr").await.status,
+        get(&state, "/api/lists/downstream?format=radarr")
+            .await
+            .status,
         StatusCode::SERVICE_UNAVAILABLE
     );
 }

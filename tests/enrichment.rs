@@ -90,7 +90,7 @@ async fn ids_are_looked_up_once_and_unknown_ones_are_remembered() {
 
     let state = state_from(&config(&server.uri())).await;
 
-    let reply = get(&state, "/api/lists/russian_only/radarr").await;
+    let reply = get(&state, "/api/lists/russian_only?format=radarr").await;
     assert_eq!(reply.json(), json!([{"id": 1, "title": "Movie 1"}]));
     // Id 3's country is still unknown, so the filter had to judge it blind.
     assert_eq!(reply.header("X-Repsetarr-Unenriched"), Some("1"));
@@ -113,7 +113,9 @@ async fn ids_are_looked_up_once_and_unknown_ones_are_remembered() {
 
     // The unfiltered list is untouched by any of this.
     assert_eq!(
-        get(&state, "/api/lists/everything/radarr").await.json(),
+        get(&state, "/api/lists/everything?format=radarr")
+            .await
+            .json(),
         json!([
             {"id": 1, "title": "Movie 1"},
             {"id": 2, "title": "Movie 2"},
@@ -139,7 +141,7 @@ async fn large_libraries_are_batched_two_hundred_at_a_time() {
         .await;
 
     let state = state_from(&config(&server.uri())).await;
-    let _ = get(&state, "/api/lists/russian_only/radarr").await;
+    let _ = get(&state, "/api/lists/russian_only?format=radarr").await;
 
     let requests = server.received_requests().await.expect("recorded");
     let sizes: Vec<usize> = requests
@@ -169,7 +171,7 @@ async fn a_quota_error_leaves_the_list_serving_unfiltered_items() {
 
     // Unknown country, and the filter's default is to exclude, so the answer is
     // empty rather than wrong - and the header says the answer is provisional.
-    let reply = get(&state, "/api/lists/russian_only/radarr").await;
+    let reply = get(&state, "/api/lists/russian_only?format=radarr").await;
     assert_eq!(reply.json(), json!([]));
     assert_eq!(reply.header("X-Repsetarr-Unenriched"), Some("2"));
     assert_eq!(reply.status, axum::http::StatusCode::OK);
@@ -212,7 +214,7 @@ lists:
     ))
     .await;
 
-    let _ = get(&state, "/api/lists/plain/radarr").await;
+    let _ = get(&state, "/api/lists/plain?format=radarr").await;
     let requests = server.received_requests().await.expect("recorded");
     assert!(
         requests

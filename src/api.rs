@@ -1,6 +1,9 @@
 //! The HTTP surface: health, the list index, and one renderer per consumer.
 
-use axum::extract::{Path, State};
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,10 +22,7 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/lists", get(index))
-        .route("/api/lists/{name}/radarr", get(radarr))
-        .route("/api/lists/{name}/sonarr", get(sonarr))
-        .route("/api/lists/{name}/kometa.yml", get(kometa))
-        .route("/api/lists/{name}/kometa", get(kometa))
+        .route("/api/lists/{name}", get(list))
         .route("/api/reload", post(reload))
         .with_state(state)
 }
@@ -51,6 +51,113 @@ impl From<EvalError> for ApiError {
             status,
             message: format!("{error}"),
         }
+    }
+}
+
+fn bad_request(message: String) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message,
+    }
+}
+
+/// The encoding a consumer asks for with `?format=`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// The normalized items themselves - the default, and what a human reads.
+    #[default]
+    Json,
+    Radarr,
+    Sonarr,
+    Kometa,
+}
+
+impl OutputFormat {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "json" => Some(OutputFormat::Json),
+            "radarr" => Some(OutputFormat::Radarr),
+            "sonarr" => Some(OutputFormat::Sonarr),
+            "kometa" => Some(OutputFormat::Kometa),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Radarr => "radarr",
+            OutputFormat::Sonarr => "sonarr",
+            OutputFormat::Kometa => "kometa",
+        }
+    }
+
+    /// The one media type the format can represent, if it is limited to one:
+    /// Radarr's import list parses movies and Sonarr's series, while Kometa and
+    /// the raw dump carry both.
+    fn media_type(self) -> Option<MediaType> {
+        match self {
+            OutputFormat::Radarr => Some(MediaType::Movie),
+            OutputFormat::Sonarr => Some(MediaType::Show),
+            OutputFormat::Json | OutputFormat::Kometa => None,
+        }
+    }
+}
+
+/// `?format=…&media_type=…`, parsed by hand so every rejection reads like the
+/// rest of the API - a JSON `error`, not axum's plain-text `Query` rejection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ListQuery {
+    format: OutputFormat,
+    media_type: MediaTypeFilter,
+}
+
+impl ListQuery {
+    fn from_params(params: &HashMap<String, String>) -> Result<Self, ApiError> {
+        let mut query = ListQuery::default();
+        // Kept verbatim so the compatibility error below quotes what was typed.
+        let mut raw_media_type = "any";
+        // Sorted so a request with two mistakes in it always names the same one.
+        let mut entries: Vec<(&String, &String)> = params.iter().collect();
+        entries.sort();
+        for (key, value) in entries {
+            match key.as_str() {
+                "format" => {
+                    query.format = OutputFormat::parse(value).ok_or_else(|| {
+                        bad_request(format!(
+                            "unknown format `{value}`, expected `json`, `radarr`, `sonarr` or `kometa`"
+                        ))
+                    })?;
+                }
+                "media_type" => {
+                    query.media_type = MediaTypeFilter::parse(value).ok_or_else(|| {
+                        bad_request(format!(
+                            "unknown media_type `{value}`, expected `any`, `movies` or `shows`"
+                        ))
+                    })?;
+                    raw_media_type = value;
+                }
+                other => {
+                    return Err(bad_request(format!(
+                        "unknown parameter `{other}`, expected `format` or `media_type`"
+                    )));
+                }
+            }
+        }
+
+        // Asking Radarr's format for shows is a mis-wired URL, not an empty list.
+        if let (Some(serves), Some(asked)) =
+            (query.format.media_type(), query.media_type.as_media_type())
+            && serves != asked
+        {
+            return Err(bad_request(format!(
+                "format `{}` serves {}s only, but media_type `{raw_media_type}` was requested",
+                query.format.as_str(),
+                serves.as_str()
+            )));
+        }
+
+        Ok(query)
     }
 }
 
@@ -106,13 +213,14 @@ async fn index(State(state): State<SharedState>) -> Json<Value> {
                 "name": name,
                 "list_formula": config.list_formula,
                 "filter": config.filter,
-                "media_type": media_type_label(config.media_type),
+                "media_type": config.media_type.as_str(),
                 "sources": compiled.map(|list| list.source_deps.clone()).unwrap_or_default(),
                 "list_deps": compiled.map(|list| list.list_deps.clone()).unwrap_or_default(),
                 "endpoints": {
-                    "radarr": format!("/api/lists/{name}/radarr"),
-                    "sonarr": format!("/api/lists/{name}/sonarr"),
-                    "kometa": format!("/api/lists/{name}/kometa.yml"),
+                    "json": format!("/api/lists/{name}"),
+                    "radarr": format!("/api/lists/{name}?format=radarr"),
+                    "sonarr": format!("/api/lists/{name}?format=sonarr"),
+                    "kometa": format!("/api/lists/{name}?format=kometa"),
                 },
             });
             let evaluation = evaluations
@@ -151,44 +259,66 @@ async fn reload(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
     }
 }
 
-async fn radarr(
+/// One list, rendered the way the caller asked for it. The list is the
+/// resource; `format` is only how it is written down.
+async fn list(
     Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<SharedState>,
 ) -> Result<Response, ApiError> {
-    let evaluation = evaluate(&state, &name)?;
-    let (payload, skipped) = radarr_payload(&evaluation.items);
-    Ok((headers(&evaluation, payload.len(), skipped), Json(payload)).into_response())
-}
+    let query = ListQuery::from_params(&params)?;
 
-async fn sonarr(
-    Path(name): Path<String>,
-    State(state): State<SharedState>,
-) -> Result<Response, ApiError> {
-    let evaluation = evaluate(&state, &name)?;
-    let (payload, skipped) = sonarr_payload(&evaluation.items);
-    Ok((headers(&evaluation, payload.len(), skipped), Json(payload)).into_response())
-}
+    // Kometa needs the list's own config, and reading it first keeps an unknown
+    // list a 404 instead of whatever evaluating it would have said.
+    let config = match query.format {
+        OutputFormat::Kometa => Some(
+            state
+                .runtime()
+                .config
+                .lists
+                .get(&name)
+                .ok_or_else(|| ApiError::from(EvalError::UnknownList(name.clone())))?
+                .clone(),
+        ),
+        _ => None,
+    };
 
-async fn kometa(
-    Path(name): Path<String>,
-    State(state): State<SharedState>,
-) -> Result<Response, ApiError> {
-    let runtime = state.runtime();
-    let config = runtime
-        .config
-        .lists
-        .get(&name)
-        .ok_or_else(|| ApiError::from(EvalError::UnknownList(name.clone())))?
-        .clone();
     let evaluation = evaluate(&state, &name)?;
-    let body = kometa_document(&name, &config, &evaluation.items);
+    // Narrowing happens here rather than in `lists`, which evaluates the whole
+    // config in one shared pass that a per-request option would invalidate.
+    let items: Cow<[Item]> = match query.media_type.as_media_type() {
+        None => Cow::Borrowed(&evaluation.items),
+        Some(_) => Cow::Owned(
+            evaluation
+                .items
+                .iter()
+                .filter(|item| query.media_type.matches(item.media_type))
+                .cloned()
+                .collect(),
+        ),
+    };
 
-    let mut response_headers = headers(&evaluation, evaluation.items.len(), 0);
-    response_headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/yaml; charset=utf-8"),
-    );
-    Ok((response_headers, body).into_response())
+    Ok(match query.format {
+        OutputFormat::Json => (headers(&evaluation, items.len(), 0), Json(items)).into_response(),
+        OutputFormat::Radarr => {
+            let (payload, skipped) = radarr_payload(&items);
+            (headers(&evaluation, payload.len(), skipped), Json(payload)).into_response()
+        }
+        OutputFormat::Sonarr => {
+            let (payload, skipped) = sonarr_payload(&items);
+            (headers(&evaluation, payload.len(), skipped), Json(payload)).into_response()
+        }
+        OutputFormat::Kometa => {
+            let config = config.expect("the kometa branch read the config above");
+            let body = kometa_document(&name, &config, &items);
+            let mut response_headers = headers(&evaluation, items.len(), 0);
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/yaml; charset=utf-8"),
+            );
+            (response_headers, body).into_response()
+        }
+    })
 }
 
 fn evaluate(state: &SharedState, name: &str) -> Result<Evaluation, ApiError> {
@@ -228,14 +358,6 @@ fn count(items: &[Item], media_type: MediaType) -> usize {
         .iter()
         .filter(|item| item.media_type == media_type)
         .count()
-}
-
-fn media_type_label(filter: MediaTypeFilter) -> &'static str {
-    match filter {
-        MediaTypeFilter::Any => "any",
-        MediaTypeFilter::Movie => "movie",
-        MediaTypeFilter::Show => "show",
-    }
 }
 
 /// Radarr's "Custom Lists" import list parses TMDb search results and reads

@@ -327,10 +327,22 @@ cache:
 |---|---|
 | `GET /api/health` | Version, uptime, and every source with its item count, age, staleness and last error |
 | `GET /api/lists` | Every list with its expression, counts, sources and endpoint URLs |
-| `GET /api/lists/{name}/radarr` | `[{"id": 550, …}]` - TMDb ids, movies only |
-| `GET /api/lists/{name}/sonarr` | `[{"title": …, "tvdbId": …, "tmdbId": …, "imdbId": …}]` - shows only |
-| `GET /api/lists/{name}/kometa.yml` | A Kometa collection file (`/kometa` works too) |
+| `GET /api/lists/{name}` | One list, encoded for whichever consumer asks - see the parameters below |
 | `POST /api/reload` | Re-read the config file |
+
+A list is one resource; `format` only decides how it is written down.
+
+| Parameter | Values | Default | Serves |
+|---|---|---|---|
+| `format` | `json` | `json` | The normalized items with every id, title, year and attribute known |
+| | `radarr` | | `[{"id": 550, …}]` - TMDb ids, movies only |
+| | `sonarr` | | `[{"title": …, "tvdbId": …, "tmdbId": …, "imdbId": …}]` - shows only |
+| | `kometa` | | A Kometa collection file, `application/yaml` |
+| `media_type` | `any` \| `movies` \| `shows` | `any` | Narrows the list for this request; `movie`/`show`/`tv`/`series` are accepted too |
+
+`media_type` only narrows - it cannot widen past the list's own `media_type:` option. An unknown
+parameter, an unknown value, or a `media_type` the format cannot serve
+(`?format=radarr&media_type=shows`) is a `400` with a JSON `error` saying which.
 
 Responses carry `X-Repsetarr-Count`, `X-Repsetarr-Skipped` (items the consumer's format could
 not represent), `X-Repsetarr-Stale` (sources serving data past its TTL) and
@@ -345,7 +357,7 @@ An unknown list is a `404`. A list whose source has never been fetched successfu
 **Radarr** - Settings → Lists → **+** → **Custom Lists** (under Advanced), then
 
 ```
-List URL: http://repsetarr:9797/api/lists/wanted_movies/radarr
+List URL: http://repsetarr:9797/api/lists/wanted_movies?format=radarr
 ```
 
 Radarr's Custom Lists parser reads TMDb ids only, so movies with no TMDb id are left out;
@@ -354,7 +366,7 @@ the count is in `X-Repsetarr-Skipped` and in the log.
 **Sonarr** - Settings → Import Lists → **+** → **Custom List**, then
 
 ```
-URL: http://repsetarr:9797/api/lists/wanted_shows/sonarr
+URL: http://repsetarr:9797/api/lists/wanted_shows?format=sonarr
 ```
 
 **Kometa** - in `config.yml`:
@@ -363,11 +375,23 @@ URL: http://repsetarr:9797/api/lists/wanted_shows/sonarr
 libraries:
   Movies:
     collection_files:
-      - url: http://repsetarr:9797/api/lists/wanted_movies/kometa.yml
+      - url: http://repsetarr:9797/api/lists/wanted_movies?format=kometa
 ```
 
 Movies come out as `tmdb_movie`, shows as `tvdb_show`, and shows with no TVDb id as
 `tmdb_show` in the same collection - Kometa unions the builders.
+
+One mixed list can feed both libraries without being written twice, by narrowing each URL:
+
+```yaml
+libraries:
+  Movies:
+    collection_files:
+      - url: http://repsetarr:9797/api/lists/everything?format=kometa&media_type=movies
+  TV Shows:
+    collection_files:
+      - url: http://repsetarr:9797/api/lists/everything?format=kometa&media_type=shows
+```
 
 ## Caching
 

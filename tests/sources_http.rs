@@ -68,10 +68,10 @@ lists:
     assert_eq!(health["sources"]["trending"]["items"], 1002);
     assert_eq!(health["status"], "ok");
 
-    let movies = get(&state, "/api/lists/movies/radarr").await.json();
+    let movies = get(&state, "/api/lists/movies?format=radarr").await.json();
     assert_eq!(movies.as_array().unwrap().len(), 1001);
 
-    let shows = get(&state, "/api/lists/all/sonarr").await.json();
+    let shows = get(&state, "/api/lists/all?format=sonarr").await.json();
     assert_eq!(shows, json!([{"tvdbId": 81189, "tmdbId": 1002}]));
 }
 
@@ -153,7 +153,7 @@ lists:
     ))
     .await;
 
-    let reply = get(&state, "/api/lists/unseen/radarr").await;
+    let reply = get(&state, "/api/lists/unseen?format=radarr").await;
     assert_eq!(
         reply.json(),
         json!([{"id": 603}]),
@@ -196,7 +196,7 @@ lists:
     ))
     .await;
 
-    let reply = get(&state, "/api/lists/missing/radarr").await;
+    let reply = get(&state, "/api/lists/missing?format=radarr").await;
     assert_eq!(
         reply.json(),
         json!([{"id": 550}, {"id": 348}]),
@@ -246,7 +246,7 @@ lists:
     assert_eq!(health["sources"]["feed"]["items"], 2);
 
     // Radarr's list needs TMDb ids, and this feed has none of them.
-    let reply = get(&state, "/api/lists/all/radarr").await;
+    let reply = get(&state, "/api/lists/all?format=radarr").await;
     assert_eq!(reply.json(), json!([]));
     assert_eq!(reply.header("X-Repsetarr-Skipped"), Some("2"));
 }

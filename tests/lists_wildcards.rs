@@ -59,7 +59,7 @@ lists:
 #[tokio::test]
 async fn a_wildcard_unions_every_matching_source_in_declaration_order() {
     let state = state_from(STUDIOS).await;
-    let reply = get(&state, "/api/lists/animation.all/radarr").await;
+    let reply = get(&state, "/api/lists/animation.all?format=radarr").await;
     assert_eq!(reply.status, StatusCode::OK);
     // Ghibli, then Disney, then Pixar - the order they are declared in, with
     // tmdb:2 kept where it first appeared.
@@ -69,7 +69,7 @@ async fn a_wildcard_unions_every_matching_source_in_declaration_order() {
 #[tokio::test]
 async fn a_pattern_composes_with_the_rest_of_the_algebra() {
     let state = state_from(STUDIOS).await;
-    let reply = get(&state, "/api/lists/everything_but_ghibli/radarr").await;
+    let reply = get(&state, "/api/lists/everything_but_ghibli?format=radarr").await;
     assert_eq!(ids(&reply.json()), vec![3, 4]);
 }
 
@@ -105,7 +105,9 @@ async fn a_source_added_later_widens_the_pattern_without_touching_the_formula() 
     std::fs::write(&path, STUDIOS).unwrap();
     let state = state_at(STUDIOS, path.clone()).await;
     assert_eq!(
-        ids(&get(&state, "/api/lists/animation.all/radarr").await.json()),
+        ids(&get(&state, "/api/lists/animation.all?format=radarr")
+            .await
+            .json()),
         vec![1, 2, 3, 4]
     );
 
@@ -121,12 +123,14 @@ async fn a_source_added_later_widens_the_pattern_without_touching_the_formula() 
     // now reaches has no data yet - and a list fails while any source it
     // depends on is cold. The background refresher is what warms it.
     assert_eq!(
-        get(&state, "/api/lists/animation.all/radarr").await.status,
+        get(&state, "/api/lists/animation.all?format=radarr")
+            .await
+            .status,
         StatusCode::SERVICE_UNAVAILABLE
     );
     repsetarr::refresh::prime(&state).await;
 
-    let reply = get(&state, "/api/lists/animation.all/radarr").await;
+    let reply = get(&state, "/api/lists/animation.all?format=radarr").await;
     assert_eq!(ids(&reply.json()), vec![1, 2, 3, 4, 7]);
 }
 

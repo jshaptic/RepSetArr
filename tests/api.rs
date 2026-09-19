@@ -35,9 +35,9 @@ lists:
 "#;
 
 #[tokio::test]
-async fn the_radarr_endpoint_serves_the_result_of_the_algebra() {
+async fn the_radarr_format_serves_the_result_of_the_algebra() {
     let state = state_from(CONFIG).await;
-    let reply = get(&state, "/api/lists/wanted_movies/radarr").await;
+    let reply = get(&state, "/api/lists/wanted_movies?format=radarr").await;
 
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -49,9 +49,9 @@ async fn the_radarr_endpoint_serves_the_result_of_the_algebra() {
 }
 
 #[tokio::test]
-async fn the_sonarr_endpoint_serves_shows_only() {
+async fn the_sonarr_format_serves_shows_only() {
     let state = state_from(CONFIG).await;
-    let reply = get(&state, "/api/lists/everything/sonarr").await;
+    let reply = get(&state, "/api/lists/everything?format=sonarr").await;
 
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -67,9 +67,9 @@ async fn the_sonarr_endpoint_serves_shows_only() {
 }
 
 #[tokio::test]
-async fn the_kometa_endpoint_serves_a_collection_file() {
+async fn the_kometa_format_serves_a_collection_file() {
     let state = state_from(CONFIG).await;
-    let reply = get(&state, "/api/lists/everything/kometa.yml").await;
+    let reply = get(&state, "/api/lists/everything?format=kometa").await;
 
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -79,18 +79,128 @@ async fn the_kometa_endpoint_serves_a_collection_file() {
     assert!(reply.body.contains("tmdb_movie: 550, 13"), "{}", reply.body);
     assert!(reply.body.contains("tvdb_show: '81189'"), "{}", reply.body);
     assert!(reply.body.contains("tmdb_show: '1399'"), "{}", reply.body);
+}
 
-    // The same document is served without the extension, for convenience.
-    let alias = get(&state, "/api/lists/everything/kometa").await;
-    assert_eq!(alias.body, reply.body);
+#[tokio::test]
+async fn the_bare_list_url_serves_the_normalized_items() {
+    let state = state_from(CONFIG).await;
+    let reply = get(&state, "/api/lists/wanted_shows").await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.json(),
+        json!([
+            {"media_type": "show", "ids": {"tvdb": 81189}, "rank": 1},
+            {"media_type": "show", "ids": {"tmdb": 1399}, "rank": 2}
+        ]),
+        "no format means the items themselves, with only the ids we know"
+    );
+    assert_eq!(reply.header("X-Repsetarr-Count"), Some("2"));
+}
+
+#[tokio::test]
+async fn media_type_narrows_a_mixed_list() {
+    let state = state_from(CONFIG).await;
+
+    let movies = get(
+        &state,
+        "/api/lists/everything?format=kometa&media_type=movies",
+    )
+    .await;
+    assert_eq!(movies.status, StatusCode::OK);
+    assert!(
+        movies.body.contains("tmdb_movie: 550, 13"),
+        "{}",
+        movies.body
+    );
+    assert!(!movies.body.contains("_show"), "{}", movies.body);
+    assert_eq!(movies.header("X-Repsetarr-Count"), Some("2"));
+
+    let shows = get(
+        &state,
+        "/api/lists/everything?format=kometa&media_type=shows",
+    )
+    .await;
+    assert!(shows.body.contains("tvdb_show: '81189'"), "{}", shows.body);
+    assert!(!shows.body.contains("tmdb_movie"), "{}", shows.body);
+    assert_eq!(shows.header("X-Repsetarr-Count"), Some("2"));
+}
+
+#[tokio::test]
+async fn media_type_accepts_the_spellings_a_human_types() {
+    let state = state_from(CONFIG).await;
+    let plural = get(&state, "/api/lists/everything?media_type=movies").await;
+    let singular = get(&state, "/api/lists/everything?media_type=movie").await;
+
+    assert_eq!(plural.status, StatusCode::OK);
+    assert_eq!(plural.body, singular.body);
+    assert_eq!(plural.header("X-Repsetarr-Count"), Some("2"));
+
+    let any = get(&state, "/api/lists/everything?media_type=any").await;
+    assert_eq!(any.header("X-Repsetarr-Count"), Some("4"));
+}
+
+#[tokio::test]
+async fn a_media_type_the_format_cannot_serve_is_a_400() {
+    let state = state_from(CONFIG).await;
+
+    let reply = get(
+        &state,
+        "/api/lists/everything?format=radarr&media_type=shows",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains("serves movies only, but media_type `shows` was requested"),
+        "the error quotes the value as it was typed: {}",
+        reply.body
+    );
+
+    let agreeing = get(
+        &state,
+        "/api/lists/everything?format=radarr&media_type=movies",
+    )
+    .await;
+    assert_eq!(
+        agreeing.status,
+        StatusCode::OK,
+        "a media_type the format already implies is fine"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_query_is_a_400_with_a_json_error() {
+    let state = state_from(CONFIG).await;
+
+    for (uri, expected) in [
+        ("/api/lists/everything?format=bogus", "unknown format"),
+        (
+            "/api/lists/everything?media_type=anime",
+            "unknown media_type",
+        ),
+        ("/api/lists/everything?fomat=radarr", "unknown parameter"),
+    ] {
+        let reply = get(&state, uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert!(
+            reply.json()["error"]
+                .as_str()
+                .expect("errors are JSON")
+                .contains(expected),
+            "{uri}: {}",
+            reply.body
+        );
+    }
 }
 
 #[tokio::test]
 async fn an_unknown_list_is_a_404() {
     let state = state_from(CONFIG).await;
-    for suffix in ["radarr", "sonarr", "kometa.yml"] {
-        let reply = get(&state, &format!("/api/lists/ghost/{suffix}")).await;
-        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{suffix}");
+    for format in ["json", "radarr", "sonarr", "kometa"] {
+        let reply = get(&state, &format!("/api/lists/ghost?format={format}")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{format}");
         assert!(reply.body.contains("ghost"), "{}", reply.body);
     }
 }
@@ -113,7 +223,7 @@ lists:
     )
     .await;
 
-    let reply = get(&state, "/api/lists/broken/radarr").await;
+    let reply = get(&state, "/api/lists/broken?format=radarr").await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(reply.body.contains("unreachable"), "{}", reply.body);
 
@@ -153,9 +263,10 @@ async fn the_index_counts_movies_and_shows_per_list() {
     assert_eq!(everything["movies"], 2);
     assert_eq!(everything["shows"], 2);
     assert_eq!(everything["sources"], json!(["trending", "owned", "shows"]));
+    assert_eq!(everything["endpoints"]["json"], "/api/lists/everything");
     assert_eq!(
         everything["endpoints"]["kometa"],
-        "/api/lists/everything/kometa.yml"
+        "/api/lists/everything?format=kometa"
     );
 }
 
@@ -184,7 +295,7 @@ lists:
     )
     .await;
 
-    let reply = get(&state, "/api/lists/first_two_minus_some/radarr").await;
+    let reply = get(&state, "/api/lists/first_two_minus_some?format=radarr").await;
     assert_eq!(
         reply.json(),
         json!([{"id": 1}, {"id": 2}]),
@@ -218,7 +329,7 @@ lists:
     // nothing to match on and both TMDb entries survive. The bridging case is
     // covered in tests/sources_http.rs, where a fetched item carries both.
     assert_eq!(
-        get(&state, "/api/lists/wanted/radarr").await.json(),
+        get(&state, "/api/lists/wanted?format=radarr").await.json(),
         json!([{"id": 550}, {"id": 603}])
     );
 }
@@ -239,7 +350,7 @@ async fn reload_picks_up_a_changed_file_and_refuses_a_broken_one() {
     assert_eq!(reply.json()["lists"], 4);
 
     // The new list is live without a restart, and its sources are already warm.
-    let added = get(&state, "/api/lists/added/radarr").await;
+    let added = get(&state, "/api/lists/added?format=radarr").await;
     assert_eq!(added.status, StatusCode::OK);
     assert_eq!(added.json(), json!([{"id": 550}, {"id": 603}, {"id": 13}]));
 
@@ -254,7 +365,7 @@ async fn reload_picks_up_a_changed_file_and_refuses_a_broken_one() {
 
     // The previous configuration is still serving.
     assert_eq!(
-        get(&state, "/api/lists/added/radarr").await.status,
+        get(&state, "/api/lists/added?format=radarr").await.status,
         StatusCode::OK
     );
 }

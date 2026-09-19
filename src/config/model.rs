@@ -461,6 +461,26 @@ impl MediaTypeFilter {
             MediaTypeFilter::Show => Some(MediaType::Show),
         }
     }
+
+    /// Lenient parsing for the request parameter, where a human types the
+    /// value; the config file stays strict, spelling it `any`/`movie`/`show`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "any" | "all" | "both" => Some(MediaTypeFilter::Any),
+            other => MediaType::parse(other).map(|media_type| match media_type {
+                MediaType::Movie => MediaTypeFilter::Movie,
+                MediaType::Show => MediaTypeFilter::Show,
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaTypeFilter::Any => "any",
+            MediaTypeFilter::Movie => "movie",
+            MediaTypeFilter::Show => "show",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

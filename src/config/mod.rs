@@ -1117,4 +1117,31 @@ lists:
         );
         assert!(error.contains("set operator"), "{error}");
     }
+
+    #[test]
+    fn the_media_type_filter_parses_the_spellings_a_url_may_carry() {
+        for raw in ["any", "ANY", " all ", "both"] {
+            assert_eq!(
+                MediaTypeFilter::parse(raw),
+                Some(MediaTypeFilter::Any),
+                "{raw}"
+            );
+        }
+        for raw in ["movie", "movies", "film"] {
+            assert_eq!(
+                MediaTypeFilter::parse(raw),
+                Some(MediaTypeFilter::Movie),
+                "{raw}"
+            );
+        }
+        for raw in ["show", "shows", "tv", "series"] {
+            assert_eq!(
+                MediaTypeFilter::parse(raw),
+                Some(MediaTypeFilter::Show),
+                "{raw}"
+            );
+        }
+        assert_eq!(MediaTypeFilter::parse("anime"), None);
+        assert_eq!(MediaTypeFilter::parse(""), None);
+    }
 }
