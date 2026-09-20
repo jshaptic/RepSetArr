@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::config::{ListConfig, MediaTypeFilter};
+use crate::config::MediaTypeFilter;
 use crate::lists::{self, EvalError, Evaluation};
 use crate::model::{Item, MediaType};
 use crate::state::SharedState;
@@ -69,16 +69,22 @@ pub enum OutputFormat {
     Json,
     Radarr,
     Sonarr,
-    Kometa,
+    /// Kometa's Text File builder, as lines.
+    KometaText,
+    /// Kometa's Text File builder, as the JSON list it also accepts.
+    KometaJson,
 }
 
 impl OutputFormat {
     fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
+        // `_` and `-` mean the same here, so neither spelling is a 400.
+        let raw = raw.trim().to_ascii_lowercase().replace('_', "-");
+        match raw.as_str() {
             "json" => Some(OutputFormat::Json),
             "radarr" => Some(OutputFormat::Radarr),
             "sonarr" => Some(OutputFormat::Sonarr),
-            "kometa" => Some(OutputFormat::Kometa),
+            "kometa-text" => Some(OutputFormat::KometaText),
+            "kometa-json" => Some(OutputFormat::KometaJson),
             _ => None,
         }
     }
@@ -88,18 +94,19 @@ impl OutputFormat {
             OutputFormat::Json => "json",
             OutputFormat::Radarr => "radarr",
             OutputFormat::Sonarr => "sonarr",
-            OutputFormat::Kometa => "kometa",
+            OutputFormat::KometaText => "kometa-text",
+            OutputFormat::KometaJson => "kometa-json",
         }
     }
 
     /// The one media type the format can represent, if it is limited to one:
-    /// Radarr's import list parses movies and Sonarr's series, while Kometa and
-    /// the raw dump carry both.
+    /// Radarr's import list parses movies and Sonarr's series, while Kometa's
+    /// text file and the raw dump carry both.
     fn media_type(self) -> Option<MediaType> {
         match self {
             OutputFormat::Radarr => Some(MediaType::Movie),
             OutputFormat::Sonarr => Some(MediaType::Show),
-            OutputFormat::Json | OutputFormat::Kometa => None,
+            OutputFormat::Json | OutputFormat::KometaText | OutputFormat::KometaJson => None,
         }
     }
 }
@@ -125,7 +132,7 @@ impl ListQuery {
                 "format" => {
                     query.format = OutputFormat::parse(value).ok_or_else(|| {
                         bad_request(format!(
-                            "unknown format `{value}`, expected `json`, `radarr`, `sonarr` or `kometa`"
+                            "unknown format `{value}`, expected `json`, `radarr`, `sonarr`, `kometa-text` or `kometa-json`"
                         ))
                     })?;
                 }
@@ -220,7 +227,8 @@ async fn index(State(state): State<SharedState>) -> Json<Value> {
                     "json": format!("/api/lists/{name}"),
                     "radarr": format!("/api/lists/{name}?format=radarr"),
                     "sonarr": format!("/api/lists/{name}?format=sonarr"),
-                    "kometa": format!("/api/lists/{name}?format=kometa"),
+                    "kometa-text": format!("/api/lists/{name}?format=kometa-text"),
+                    "kometa-json": format!("/api/lists/{name}?format=kometa-json"),
                 },
             });
             let evaluation = evaluations
@@ -267,22 +275,6 @@ async fn list(
     State(state): State<SharedState>,
 ) -> Result<Response, ApiError> {
     let query = ListQuery::from_params(&params)?;
-
-    // Kometa needs the list's own config, and reading it first keeps an unknown
-    // list a 404 instead of whatever evaluating it would have said.
-    let config = match query.format {
-        OutputFormat::Kometa => Some(
-            state
-                .runtime()
-                .config
-                .lists
-                .get(&name)
-                .ok_or_else(|| ApiError::from(EvalError::UnknownList(name.clone())))?
-                .clone(),
-        ),
-        _ => None,
-    };
-
     let evaluation = evaluate(&state, &name)?;
     // Narrowing happens here rather than in `lists`, which evaluates the whole
     // config in one shared pass that a per-request option would invalidate.
@@ -308,15 +300,18 @@ async fn list(
             let (payload, skipped) = sonarr_payload(&items);
             (headers(&evaluation, payload.len(), skipped), Json(payload)).into_response()
         }
-        OutputFormat::Kometa => {
-            let config = config.expect("the kometa branch read the config above");
-            let body = kometa_document(&name, &config, &items);
-            let mut response_headers = headers(&evaluation, items.len(), 0);
+        OutputFormat::KometaText => {
+            let (body, skipped) = kometa_text(&name, &items);
+            let mut response_headers = headers(&evaluation, items.len() - skipped, skipped);
             response_headers.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("application/yaml; charset=utf-8"),
+                HeaderValue::from_static("text/plain; charset=utf-8"),
             );
             (response_headers, body).into_response()
+        }
+        OutputFormat::KometaJson => {
+            let (payload, skipped) = kometa_json(&items);
+            (headers(&evaluation, payload.len(), skipped), Json(payload)).into_response()
         }
     })
 }
@@ -429,71 +424,110 @@ pub fn sonarr_payload(items: &[Item]) -> (Vec<SonarrSeries>, usize) {
     (payload, without_tvdb)
 }
 
-/// A Kometa collection file, to be loaded with `collection_files: - url: …`.
+/// The id Kometa should match an item by, most reliable first.
 ///
-/// Multiple builders in one collection are unioned by Kometa, so shows that
-/// have no TVDb id can still be carried by `tmdb_show`.
-pub fn kometa_document(name: &str, config: &ListConfig, items: &[Item]) -> String {
-    use serde_yaml_ng::{Mapping, Value as Yaml};
+/// TVDb is what a Plex show library keys on, IMDb is next and is spelled the
+/// same way in both of Kometa's input shapes, and a show's TMDb id comes last
+/// because it is the one needing a `_show`-qualified type. `None` means the
+/// item carries nothing Kometa could look up.
+fn kometa_id(item: &Item) -> Option<KometaId<'_>> {
+    match item.media_type {
+        MediaType::Movie => item
+            .ids
+            .tmdb
+            .map(KometaId::Tmdb)
+            .or_else(|| item.ids.imdb.as_deref().map(KometaId::Imdb)),
+        MediaType::Show => item
+            .ids
+            .tvdb
+            .map(KometaId::Tvdb)
+            .or_else(|| item.ids.imdb.as_deref().map(KometaId::Imdb))
+            .or_else(|| item.ids.tmdb.map(KometaId::TmdbShow)),
+    }
+}
 
-    let ids = |media_type: MediaType, pick: &dyn Fn(&Item) -> Option<u32>| -> String {
-        items
-            .iter()
-            .filter(|item| item.media_type == media_type)
-            .filter_map(pick)
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+/// One id, in the two spellings Kometa's Text File builder accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KometaId<'a> {
+    Tmdb(u32),
+    TmdbShow(u32),
+    Tvdb(u32),
+    Imdb(&'a str),
+}
 
-    let movies = ids(MediaType::Movie, &|item| item.ids.tmdb);
-    let shows_by_tvdb = ids(MediaType::Show, &|item| item.ids.tvdb);
-    let shows_by_tmdb = ids(MediaType::Show, &|item| {
-        item.ids.tvdb.is_none().then_some(item.ids.tmdb).flatten()
-    });
-
-    let mut block = Mapping::new();
-    let mut insert = |key: &str, value: &str| {
-        if !value.is_empty() {
-            block.insert(Yaml::from(key), Yaml::from(value));
+impl KometaId<'_> {
+    /// A prefixed line value, e.g. `tmdb:550`. Repsetarr always writes the
+    /// prefix: a bare number means TMDb in a movie library and TVDb in a show
+    /// library, which is exactly the guess not worth making.
+    fn line(self) -> String {
+        match self {
+            // A show library reads `tmdb:` as the show, a movie library as the
+            // movie, so one prefix covers both.
+            KometaId::Tmdb(id) | KometaId::TmdbShow(id) => format!("tmdb:{id}"),
+            KometaId::Tvdb(id) => format!("tvdb:{id}"),
+            KometaId::Imdb(id) => format!("imdb:{id}"),
         }
-    };
-    insert("tmdb_movie", &movies);
-    insert("tvdb_show", &shows_by_tvdb);
-    insert("tmdb_show", &shows_by_tmdb);
-
-    let mut document = Mapping::new();
-    if block.is_empty() {
-        // Every builder is empty; emitting a builderless collection would make
-        // Kometa fail the run, so the file is deliberately left with none.
-        document.insert(Yaml::from("collections"), Yaml::Mapping(Mapping::new()));
-    } else {
-        block.insert(
-            Yaml::from("sync_mode"),
-            Yaml::from(config.kometa.sync_mode.as_str()),
-        );
-        block.insert(
-            Yaml::from("collection_order"),
-            Yaml::from(config.kometa.collection_order.as_str()),
-        );
-        for (key, value) in &config.kometa.extra {
-            block.insert(Yaml::from(key.as_str()), value.clone());
-        }
-        let collection = config
-            .kometa
-            .collection
-            .clone()
-            .unwrap_or_else(|| name.to_string());
-        let mut collections = Mapping::new();
-        collections.insert(Yaml::from(collection), Yaml::Mapping(block));
-        document.insert(Yaml::from("collections"), Yaml::Mapping(collections));
     }
 
-    let body = serde_yaml_ng::to_string(&document).expect("a mapping always serializes");
-    format!(
-        "# Generated by Repsetarr {VERSION} - list `{name}` - {} item(s)\n{body}",
-        items.len()
-    )
+    /// One entry of a JSON list. `imdb_id` and `tmdb_id` are the documented
+    /// keys; a TVDb show has none, so it goes through the generic `type`/`id`
+    /// escape hatch with the internal id names Kometa's own docs mention.
+    fn entry(self) -> Value {
+        match self {
+            KometaId::Tmdb(id) => json!({ "tmdb_id": id }),
+            KometaId::TmdbShow(id) => json!({ "type": "tmdb_show", "id": id }),
+            KometaId::Tvdb(id) => json!({ "type": "tvdb", "id": id }),
+            KometaId::Imdb(id) => json!({ "imdb_id": id }),
+        }
+    }
+}
+
+/// A Kometa text file, to be loaded with `text_file: <url>`. The collection
+/// itself stays in Kometa's own config, which is where people want it.
+///
+/// Returns the body and the number of items carrying no id Kometa could use.
+pub fn kometa_text(name: &str, items: &[Item]) -> (String, usize) {
+    let lines: Vec<(String, Option<String>)> = items
+        .iter()
+        .filter_map(|item| Some((kometa_id(item)?.line(), comment(item))))
+        .collect();
+    let skipped = items.len() - lines.len();
+
+    // Kometa ignores everything after a `#`, so the header and the titles cost
+    // nothing but make the URL readable in a browser.
+    let width = lines.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+    let mut body = format!(
+        "# Generated by Repsetarr {VERSION} - list `{name}` - {} item(s)\n",
+        lines.len()
+    );
+    for (id, comment) in &lines {
+        match comment {
+            Some(comment) => body.push_str(&format!("{id:width$} # {comment}\n")),
+            None => body.push_str(&format!("{id}\n")),
+        }
+    }
+    (body, skipped)
+}
+
+/// `Title (Year)`, or nothing at all when the title is unknown.
+fn comment(item: &Item) -> Option<String> {
+    let title = item.title.as_deref()?.trim();
+    Some(match item.effective_year() {
+        Some(year) => format!("{title} ({year})"),
+        None => title.to_string(),
+    })
+}
+
+/// The JSON list the same `text_file: <url>` may return instead of lines.
+///
+/// Returns the payload and the number of items carrying no id Kometa could use.
+pub fn kometa_json(items: &[Item]) -> (Vec<Value>, usize) {
+    let payload: Vec<Value> = items
+        .iter()
+        .filter_map(|item| Some(kometa_id(item)?.entry()))
+        .collect();
+    let skipped = items.len() - payload.len();
+    (payload, skipped)
 }
 
 #[cfg(test)]
@@ -564,59 +598,103 @@ mod tests {
         );
     }
 
-    fn list_config() -> ListConfig {
-        serde_yaml_ng::from_str("list_formula: a").unwrap()
+    /// A show carrying only the id in `only`, to pin down the fallback order.
+    fn bare_show(tvdb: Option<u32>, tmdb: Option<u32>, imdb: Option<&str>) -> Item {
+        Item {
+            media_type: MediaType::Show,
+            ids: MediaIds {
+                tmdb,
+                tvdb,
+                imdb: imdb.map(str::to_string),
+                ..Default::default()
+            },
+            title: Some("Some Show".into()),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn the_kometa_document_uses_id_builders() {
+    fn the_kometa_text_file_prefixes_every_id() {
+        let items = vec![
+            movie(Some(550), Some("tt0137523"), "Fight Club", 1999),
+            movie(None, Some("tt0133093"), "The Matrix", 1999),
+            show(Some(81189), Some(1396), "Breaking Bad"),
+        ];
+        let (body, skipped) = kometa_text("wanted", &items);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            body.lines().skip(1).collect::<Vec<_>>(),
+            vec![
+                "tmdb:550       # Fight Club (1999)",
+                "imdb:tt0133093 # The Matrix (1999)",
+                "tvdb:81189     # Breaking Bad",
+            ],
+            "ids are prefixed and the comments line up"
+        );
+        assert!(body.starts_with("# Generated by Repsetarr"), "{body}");
+    }
+
+    #[test]
+    fn the_kometa_json_list_uses_the_documented_keys_where_there_are_any() {
+        let items = vec![
+            movie(Some(550), Some("tt0137523"), "Fight Club", 1999),
+            movie(None, Some("tt0133093"), "The Matrix", 1999),
+            show(Some(81189), Some(1396), "Breaking Bad"),
+        ];
+        let (payload, skipped) = kometa_json(&items);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            json!(payload),
+            json!([
+                {"tmdb_id": 550},
+                {"imdb_id": "tt0133093"},
+                // No documented top-level TVDb key, so the generic escape hatch.
+                {"type": "tvdb", "id": 81189}
+            ])
+        );
+    }
+
+    #[test]
+    fn a_show_falls_back_tvdb_then_imdb_then_tmdb() {
+        let cases = [
+            (bare_show(Some(1), Some(2), Some("tt3")), "tvdb:1"),
+            (bare_show(None, Some(2), Some("tt3")), "imdb:tt3"),
+            (bare_show(None, Some(2), None), "tmdb:2"),
+        ];
+        for (item, expected) in cases {
+            let (body, skipped) = kometa_text("wanted", std::slice::from_ref(&item));
+            assert_eq!(skipped, 0);
+            assert!(
+                body.lines().nth(1).expect("one line").starts_with(expected),
+                "{expected}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_item_kometa_could_not_look_up_is_skipped_and_counted() {
         let items = vec![
             movie(Some(550), None, "Fight Club", 1999),
-            movie(Some(603), None, "The Matrix", 1999),
-            show(Some(81189), Some(1396), "Breaking Bad"),
-            show(None, Some(1399), "Game of Thrones"),
+            bare_show(None, None, None),
         ];
-        let document = kometa_document("wanted", &list_config(), &items);
+        let (body, skipped) = kometa_text("wanted", &items);
+        assert_eq!(skipped, 1);
+        assert_eq!(body.lines().count(), 2, "the header and one id: {body}");
+        assert!(body.contains("1 item(s)"), "{body}");
+
+        let (payload, skipped) = kometa_json(&items);
+        assert_eq!(skipped, 1);
+        assert_eq!(payload.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_list_is_just_the_header() {
+        let (body, skipped) = kometa_text("wanted", &[]);
+        assert_eq!(skipped, 0);
         assert_eq!(
-            document.lines().skip(1).collect::<Vec<_>>().join("\n"),
-            concat!(
-                "collections:\n",
-                "  wanted:\n",
-                "    tmdb_movie: 550, 603\n",
-                "    tvdb_show: '81189'\n",
-                "    tmdb_show: '1399'\n",
-                "    sync_mode: sync\n",
-                "    collection_order: custom"
-            )
+            body,
+            format!("# Generated by Repsetarr {VERSION} - list `wanted` - 0 item(s)\n")
         );
-        assert!(document.starts_with("# Generated by Repsetarr"));
-    }
-
-    #[test]
-    fn the_kometa_collection_name_and_extras_are_configurable() {
-        let mut config = list_config();
-        config.kometa.collection = Some("Wanted Movies".into());
-        config.kometa.sync_mode = "append".into();
-        config.kometa.extra.insert(
-            "summary".into(),
-            serde_yaml_ng::Value::from("Everything I still want"),
-        );
-        let document = kometa_document(
-            "wanted",
-            &config,
-            &[movie(Some(550), None, "Fight Club", 1999)],
-        );
-        assert!(document.contains("  Wanted Movies:"), "{document}");
-        assert!(document.contains("sync_mode: append"), "{document}");
-        assert!(
-            document.contains("summary: Everything I still want"),
-            "{document}"
-        );
-    }
-
-    #[test]
-    fn an_empty_list_produces_no_builderless_collection() {
-        let document = kometa_document("wanted", &list_config(), &[]);
-        assert!(document.contains("collections: {}"), "{document}");
+        assert_eq!(kometa_json(&[]), (vec![], 0));
     }
 }

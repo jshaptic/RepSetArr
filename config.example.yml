@@ -124,10 +124,6 @@ lists:
   #   sort: rank             # none | rank | title | year | released | random
   #   order: asc             # asc | desc
   #   limit: 200
-  #   kometa:
-  #     collection: Wanted Movies
-  #     sync_mode: sync
-  #     collection_order: custom
   example:
     list_formula: "never"
     media_type: movie

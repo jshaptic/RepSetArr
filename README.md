@@ -31,7 +31,7 @@ lists:
     list_formula: "(trending | top250) - my_radarr - never"
 ```
 
-That list is then an import list URL in Radarr, or a collection file URL in Kometa. There is
+That list is then an import list URL in Radarr, or a `text_file:` URL in Kometa. There is
 no UI - the API *is* the product.
 
 ## Quick start
@@ -196,10 +196,6 @@ sources:
 | `sort` | `none` | `none`, `rank`, `title`, `year`, `released`, `random` |
 | `order` | `asc` | `asc` or `desc` |
 | `limit` | - | Keep the first N after sorting |
-| `kometa.collection` | *(list name)* | Collection name in the generated YAML |
-| `kometa.sync_mode` | `sync` | Passed through to Kometa |
-| `kometa.collection_order` | `custom` | Passed through to Kometa |
-| `kometa.extra` | - | Any extra keys copied into the collection block |
 
 Filters, sort and limit run **after** the algebra, and a list referenced from another
 expression contributes its post-processed contents. With `sort: none` the order is the one
@@ -337,7 +333,8 @@ A list is one resource; `format` only decides how it is written down.
 | `format` | `json` | `json` | The normalized items with every id, title, year and attribute known |
 | | `radarr` | | `[{"id": 550, …}]` - TMDb ids, movies only |
 | | `sonarr` | | `[{"title": …, "tvdbId": …, "tmdbId": …, "imdbId": …}]` - shows only |
-| | `kometa` | | A Kometa collection file, `application/yaml` |
+| | `kometa-text` | | Kometa Text File builder input - one prefixed id per line, `text/plain` |
+| | `kometa-json` | | The JSON list the same builder also accepts |
 | `media_type` | `any` \| `movies` \| `shows` | `any` | Narrows the list for this request; `movie`/`show`/`tv`/`series` are accepted too |
 
 `media_type` only narrows - it cannot widen past the list's own `media_type:` option. An unknown
@@ -369,29 +366,36 @@ the count is in `X-Repsetarr-Skipped` and in the log.
 URL: http://repsetarr:9797/api/lists/wanted_shows?format=sonarr
 ```
 
-**Kometa** - in `config.yml`:
+**Kometa** - as a [Text File builder](https://kometa.wiki/en/latest/files/builders/textfile/text-file/)
+in a collection file. The collection stays yours; Repsetarr only supplies its contents:
 
 ```yaml
-libraries:
-  Movies:
-    collection_files:
-      - url: http://repsetarr:9797/api/lists/wanted_movies?format=kometa
+collections:
+  Wanted Movies:
+    text_file: http://repsetarr:9797/api/lists/wanted_movies?format=kometa-text
+    collection_order: custom
+    sync_mode: sync
 ```
 
-Movies come out as `tmdb_movie`, shows as `tvdb_show`, and shows with no TVDb id as
-`tmdb_show` in the same collection - Kometa unions the builders.
+Each line is an explicitly prefixed id - `tmdb:550`, `tvdb:81189`, `imdb:tt0137523` - so nothing
+depends on the library type guessing what a bare number means. Movies prefer their TMDb id, shows
+their TVDb id, and both fall back through IMDb; an item carrying none of the three is left out and
+counted in `X-Repsetarr-Skipped`. The title and year ride along as comments, which Kometa ignores.
 
-One mixed list can feed both libraries without being written twice, by narrowing each URL:
+A `text_file:` URL is read inside one library, so narrow a mixed list with `media_type` rather
+than serving movies to a show library:
 
 ```yaml
-libraries:
-  Movies:
-    collection_files:
-      - url: http://repsetarr:9797/api/lists/everything?format=kometa&media_type=movies
-  TV Shows:
-    collection_files:
-      - url: http://repsetarr:9797/api/lists/everything?format=kometa&media_type=shows
+# Movies library
+    text_file: http://repsetarr:9797/api/lists/everything?format=kometa-text&media_type=movies
+# TV Shows library
+    text_file: http://repsetarr:9797/api/lists/everything?format=kometa-text&media_type=shows
 ```
+
+`format=kometa-json` serves the JSON list the same builder accepts. Prefer `kometa-text` for
+shows: the JSON shape has no documented key for a bare TVDb id, so Repsetarr has to fall back to
+Kometa's generic `{"type": "tvdb", "id": 81189}` form there, while `tvdb:81189` is documented
+plainly for a text file.
 
 ## Caching
 

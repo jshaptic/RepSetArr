@@ -509,8 +509,6 @@ pub struct ListConfig {
     pub order: SortOrder,
     #[serde(default)]
     pub limit: Option<usize>,
-    #[serde(default)]
-    pub kometa: KometaConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -533,38 +531,4 @@ pub enum SortOrder {
     #[default]
     Asc,
     Desc,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KometaConfig {
-    /// Collection name in the generated file; defaults to the list name.
-    #[serde(default)]
-    pub collection: Option<String>,
-    #[serde(default = "default_sync_mode")]
-    pub sync_mode: String,
-    #[serde(default = "default_collection_order")]
-    pub collection_order: String,
-    /// Copied verbatim into the collection block.
-    #[serde(default)]
-    pub extra: BTreeMap<String, serde_yaml_ng::Value>,
-}
-
-impl Default for KometaConfig {
-    fn default() -> Self {
-        KometaConfig {
-            collection: None,
-            sync_mode: default_sync_mode(),
-            collection_order: default_collection_order(),
-            extra: BTreeMap::new(),
-        }
-    }
-}
-
-fn default_sync_mode() -> String {
-    "sync".to_string()
-}
-
-fn default_collection_order() -> String {
-    "custom".to_string()
 }
